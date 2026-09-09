@@ -36,6 +36,11 @@ body {
   gap: 8px;
 }
 
+.popup-header .icon {
+  color: var(--blue);
+  flex-shrink: 0;
+}
+
 .popup-header h2 {
   font-size: 15px;
   font-weight: 700;

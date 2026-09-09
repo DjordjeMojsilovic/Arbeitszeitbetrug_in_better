@@ -3,23 +3,39 @@
  * container element using the shared engines from core/casino-games.js and
  * settles bets through the shared CasinoWallet. Games marked `duel: true`
  * additionally support a peer-to-peer "vs. friend" mode over the same
- * WebRTC connection used by the Arcade tab (see startQuickDuel below).
+ * WebRTC connection used by the Arcade tab. Every settled round is also
+ * written to the local result ledger via ctx.recordResult so it shows up
+ * on the Rangliste (leaderboard) tab.
  */
 (function (root) {
   'use strict';
 
+  const Icon = (name, opts) => window.AZIcon(name, opts);
+
   function fmt(n) { return n.toLocaleString('de-DE'); }
 
+  /** Records a settled round to the ledger: positive/negative/zero net change. */
+  function settle(ctx, bet, payout) {
+    const delta = payout - bet;
+    if (delta > 0) ctx.recordResult('win', delta);
+    else if (delta < 0) ctx.recordResult('lose', delta);
+    else ctx.recordResult('tie', 0);
+  }
+
   function cardHtml(card, opts = {}) {
-    if (!card || opts.faceDown) return `<div class="az-playing-card az-face-down">🂠</div>`;
+    if (!card || opts.faceDown) return `<div class="az-playing-card az-face-down"></div>`;
     return `<div class="az-playing-card ${card.red ? 'az-red' : ''} ${opts.held ? 'az-held' : ''}">
       <div>${card.rank}</div><div>${card.suit}</div>
     </div>`;
   }
 
+  const PIP_LAYOUTS = {
+    1: [4], 2: [0, 8], 3: [0, 4, 8], 4: [0, 2, 6, 8], 5: [0, 2, 4, 6, 8], 6: [0, 2, 3, 5, 6, 8]
+  };
   function dieHtml(v) {
-    const pips = ['', '⚀', '⚁', '⚂', '⚃', '⚄', '⚅'];
-    return `<div class="az-die">${pips[v] || v}</div>`;
+    const active = new Set(PIP_LAYOUTS[v] || []);
+    const dots = Array.from({ length: 9 }, (_, i) => `<span style="width:5px;height:5px;border-radius:50%;background:${active.has(i) ? 'currentColor' : 'transparent'};"></span>`).join('');
+    return `<div class="az-die"><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:3px;width:24px;height:24px;">${dots}</div></div>`;
   }
 
   function betControl(id, defaultValue = 10) {
@@ -45,23 +61,20 @@
 
   function duelToggleHtml(connected) {
     return `<div class="az-segmented" style="margin-bottom:8px;">
-      <button data-duel-mode="house" class="az-active">🏠 Gegen Haus</button>
-      <button data-duel-mode="friend" ${connected ? '' : 'disabled title="Erst im Arcade-Tab verbinden"'}>🌐 Gegen Freund</button>
+      <button data-duel-mode="house" class="az-active az-flex az-gap-1"><span>Gegen Haus</span></button>
+      <button data-duel-mode="friend" class="az-flex az-gap-1" ${connected ? '' : 'disabled title="Erst im Arcade-Tab verbinden"'}>${Icon('globe', { size: 14 })}<span>Gegen Freund</span></button>
     </div>`;
   }
 
   function wireDuelToggle(container, ctx, onModeChange) {
-    let mode = 'house';
     const btns = container.querySelectorAll('[data-duel-mode]');
     btns.forEach(btn => {
       btn.addEventListener('click', () => {
         if (btn.disabled) return;
-        mode = btn.getAttribute('data-duel-mode');
         btns.forEach(b => b.classList.toggle('az-active', b === btn));
-        onModeChange(mode);
+        onModeChange(btn.getAttribute('data-duel-mode'));
       });
     });
-    return () => mode;
   }
 
   // ==========================================================
@@ -72,13 +85,13 @@
     container.innerHTML = `
       <div class="az-flex-col az-gap-3" style="align-items:center;">
         <div class="az-slot-reels">
-          <div class="az-slot-reel" id="r0">💼</div>
-          <div class="az-slot-reel" id="r1">💰</div>
-          <div class="az-slot-reel" id="r2">7️⃣</div>
+          <div class="az-slot-reel" id="r0">${Icon(engine.symbols[0], { size: 26 })}</div>
+          <div class="az-slot-reel" id="r1">${Icon(engine.symbols[1], { size: 26 })}</div>
+          <div class="az-slot-reel" id="r2">${Icon(engine.symbols[2], { size: 26 })}</div>
         </div>
         ${betControl('slot-bet', 10)}
-        <button id="slot-spin" class="az-btn az-btn-block">🎰 Spin</button>
-        <div class="az-result-banner" id="slot-banner">Viel Glück!</div>
+        <button id="slot-spin" class="az-btn az-btn-block">Drehen</button>
+        <div class="az-result-banner" id="slot-banner">Viel Glück.</div>
       </div>`;
     const banner = container.querySelector('#slot-banner');
     const spinBtn = container.querySelector('#slot-spin');
@@ -86,25 +99,26 @@
 
     spinBtn.onclick = () => {
       const bet = readBet(container, 'slot-bet', ctx.wallet);
-      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
       spinBtn.disabled = true;
       reels.forEach(r => r.classList.add('az-spinning'));
       ctx.playSound('spin');
       const result = engine.spin(bet);
       let ticks = 0;
       const iv = setInterval(() => {
-        reels.forEach(r => r.textContent = engine.symbols[Math.floor(Math.random() * engine.symbols.length)]);
+        reels.forEach(r => r.innerHTML = Icon(engine.symbols[Math.floor(Math.random() * engine.symbols.length)], { size: 26 }));
         ticks++;
         if (ticks > 8) {
           clearInterval(iv);
-          reels.forEach((r, i) => { r.classList.remove('az-spinning'); r.textContent = result.reels[i]; });
+          reels.forEach((r, i) => { r.classList.remove('az-spinning'); r.innerHTML = Icon(result.reels[i], { size: 26 }); });
           spinBtn.disabled = false;
+          settle(ctx, bet, result.payout);
           if (result.win) {
             ctx.wallet.award(result.payout);
-            setBanner(banner, `${result.label}! +${fmt(result.payout)} 💰`, 'win');
+            setBanner(banner, `${result.label} — plus ${fmt(result.payout)}`, 'win');
             ctx.playSound('win');
           } else {
-            setBanner(banner, 'Kein Treffer, nochmal versuchen!', 'lose');
+            setBanner(banner, 'Kein Treffer, nochmal versuchen.', 'lose');
           }
         }
       }, 80);
@@ -141,7 +155,7 @@
     function showPlayControls() {
       controls.innerHTML = `<button id="bj-hit" class="az-btn">Hit</button><button id="bj-stand" class="az-btn az-btn-secondary">Stand</button>`;
       container.querySelector('#bj-hit').onclick = () => {
-        const r = engine.hit();
+        engine.hit();
         renderHands(true);
         if (engine.phase === 'done') finish();
       };
@@ -160,18 +174,21 @@
       renderHands(false);
       const r = engine.result;
       const labels = {
-        blackjack: 'Blackjack! 🎉', win: 'Gewonnen!', dealer_bust: 'Dealer überkauft — gewonnen!',
-        lose: 'Verloren.', dealer_blackjack: 'Dealer hat Blackjack.', bust: 'Überkauft!', push: 'Unentschieden.'
+        blackjack: 'Blackjack.', win: 'Gewonnen.', dealer_bust: 'Dealer überkauft — gewonnen.',
+        lose: 'Verloren.', dealer_blackjack: 'Dealer hat Blackjack.', bust: 'Überkauft.', push: 'Unentschieden.'
       };
+      settle(ctx, engine.bet, r.payout);
       if (r.payout > 0) ctx.wallet.award(r.payout);
-      setBanner(banner, `${labels[r.outcome] || ''} (${r.payout > 0 ? '+' + fmt(r.payout) : '±0'})`, r.payout > engine.bet ? 'win' : (r.payout === engine.bet ? '' : 'lose'));
+      const net = r.payout - engine.bet;
+      const netLabel = net > 0 ? `+${fmt(net)}` : net < 0 ? `${fmt(net)}` : '±0';
+      setBanner(banner, `${labels[r.outcome] || ''} (${netLabel})`, net > 0 ? 'win' : (net === 0 ? '' : 'lose'));
       ctx.playSound(r.payout > engine.bet ? 'win' : 'lose');
       showDealControls();
     }
 
     function deal() {
       const bet = readBet(container, 'bj-bet', ctx.wallet);
-      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
       engine.deal(bet);
       renderHands(true);
       if (engine.phase === 'done') { finish(); return; }
@@ -202,7 +219,7 @@
           <button class="az-choice-btn" data-type="dozen" data-value="2">2. Dutzend</button>
           <button class="az-choice-btn" data-type="dozen" data-value="3">3. Dutzend</button>
         </div>
-        <button id="rl-spin" class="az-btn az-btn-block">🎡 Drehen</button>
+        <button id="rl-spin" class="az-btn az-btn-block">Drehen</button>
         <div class="az-result-banner" id="rl-banner">Wähle deine Wette.</div>
       </div>`;
     let selected = { type: 'color', value: 'red' };
@@ -217,19 +234,20 @@
     const resultEl = container.querySelector('#rl-result');
     container.querySelector('#rl-spin').onclick = () => {
       const bet = readBet(container, 'rl-bet', ctx.wallet);
-      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
       ctx.playSound('spin');
       const result = engine.spin(selected.type, selected.value, bet);
-      resultEl.textContent = '...';
+      resultEl.textContent = '···';
       setTimeout(() => {
         resultEl.textContent = result.number;
         resultEl.className = 'az-roulette-number az-num-' + result.color;
+        settle(ctx, bet, result.payout);
         if (result.win) {
           ctx.wallet.award(result.payout);
-          setBanner(banner, `${result.number} (${result.color}) — Gewonnen! +${fmt(result.payout)}`, 'win');
+          setBanner(banner, `${result.number} (${result.color}) — gewonnen, plus ${fmt(result.payout)}`, 'win');
           ctx.playSound('win');
         } else {
-          setBanner(banner, `${result.number} (${result.color}) — Verloren.`, 'lose');
+          setBanner(banner, `${result.number} (${result.color}) — verloren.`, 'lose');
         }
       }, 700);
     };
@@ -244,7 +262,7 @@
     container.innerHTML = `
       <div class="az-flex-col az-gap-3" style="align-items:center;">
         <div class="az-hand-row" id="vp-hand"></div>
-        <div class="az-text-footnote">Bube-oder-besser gewinnt · Karten antippen zum Halten</div>
+        <div class="az-text-footnote">Bube oder besser gewinnt — Karten antippen zum Halten.</div>
         ${betControl('vp-bet', 10)}
         <button id="vp-action" class="az-btn az-btn-block">Deal</button>
         <div class="az-result-banner" id="vp-banner">Setze deinen Einsatz und drücke Deal.</div>
@@ -268,7 +286,7 @@
     actionBtn.onclick = () => {
       if (engine.phase === 'idle' || engine.phase === 'done') {
         const bet = readBet(container, 'vp-bet', ctx.wallet);
-        if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+        if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
         held = [];
         const hand = engine.deal(bet);
         renderHand(hand);
@@ -277,9 +295,10 @@
       } else {
         const r = engine.draw(held);
         renderHand(r.hand);
+        settle(ctx, engine.bet, r.payout);
         if (r.win) {
           ctx.wallet.award(r.payout);
-          setBanner(banner, `${r.rank.label}! +${fmt(r.payout)} 💰`, 'win');
+          setBanner(banner, `${r.rank.label} — plus ${fmt(r.payout)}`, 'win');
           ctx.playSound('win');
         } else {
           setBanner(banner, `${r.rank.label} — kein Gewinn.`, 'lose');
@@ -324,15 +343,16 @@
     const banner = container.querySelector('#bc-banner');
     container.querySelector('#bc-deal').onclick = () => {
       const bet = readBet(container, 'bc-bet', ctx.wallet);
-      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
       const r = engine.play(betOn, bet);
       container.querySelector('#bc-banker').innerHTML = r.banker.map(c => cardHtml(c)).join('');
       container.querySelector('#bc-player').innerHTML = r.player.map(c => cardHtml(c)).join('');
       const won = r.payout > bet;
       const push = r.payout === bet;
+      settle(ctx, bet, r.payout);
       if (r.payout > 0) ctx.wallet.award(r.payout);
       const winnerLabel = { player: 'Spieler', banker: 'Banker', tie: 'Unentschieden' }[r.winner];
-      setBanner(banner, `${winnerLabel} gewinnt (${r.playerTotal} vs ${r.bankerTotal}) ${won ? '+' + fmt(r.payout) : push ? '± 0' : 'verloren'}`, won ? 'win' : (push ? '' : 'lose'));
+      setBanner(banner, `${winnerLabel} gewinnt (${r.playerTotal} vs ${r.bankerTotal})${won ? ', plus ' + fmt(r.payout) : push ? ', unentschieden' : ', verloren'}`, won ? 'win' : (push ? '' : 'lose'));
       ctx.playSound(won ? 'win' : 'lose');
     };
   }
@@ -345,9 +365,9 @@
     container.innerHTML = `
       <div class="az-flex-col az-gap-3" style="align-items:center;">
         ${duelToggleHtml(ctx.duel.isConnected())}
-        <div class="az-flex az-gap-2" id="cr-dice"><div class="az-die">?</div><div class="az-die">?</div></div>
+        <div class="az-flex az-gap-2" id="cr-dice"><div class="az-die"></div><div class="az-die"></div></div>
         ${betControl('cr-bet', 15)}
-        <button id="cr-roll" class="az-btn az-btn-block">🎲 Werfen</button>
+        <button id="cr-roll" class="az-btn az-btn-block">Werfen</button>
         <div class="az-result-banner" id="cr-banner">Come-out Roll: 7/11 gewinnt sofort, 2/3/12 verliert sofort.</div>
       </div>`;
     const banner = container.querySelector('#cr-banner');
@@ -358,7 +378,7 @@
 
     wireDuelToggle(container, ctx, (mode) => {
       duelMode = mode;
-      rollBtn.textContent = mode === 'friend' ? '🌐 Duell starten' : '🎲 Werfen';
+      rollBtn.textContent = mode === 'friend' ? 'Duell starten' : 'Werfen';
       setBanner(banner, mode === 'friend' ? 'Beide setzen den gleichen Einsatz — höhere Augensumme gewinnt.' : 'Come-out Roll: 7/11 gewinnt sofort, 2/3/12 verliert sofort.', '');
     });
 
@@ -366,7 +386,7 @@
       if (data.type !== 'craps_start' && data.type !== 'craps_response') return;
       if (data.type === 'craps_start') {
         if (duelPending) return;
-        if (!ctx.wallet.place(data.stake)) { setBanner(banner, 'Nicht genug Coins für das Duell!', 'lose'); return; }
+        if (!ctx.wallet.place(data.stake)) { setBanner(banner, 'Nicht genug Coins für das Duell.', 'lose'); return; }
         const mine = root.CrapsEngine.duelRoll();
         diceEl.innerHTML = mine.dice.map(dieHtml).join('');
         ctx.duel.send('craps_response', { mySum: mine.sum, stake: data.stake });
@@ -378,19 +398,20 @@
     });
 
     function resolveDuel(hostSum, guestSum, stake) {
-      if (hostSum === guestSum) { ctx.wallet.award(stake); setBanner(banner, `Unentschieden (${hostSum}) — Einsatz zurück.`, ''); return; }
+      if (hostSum === guestSum) { ctx.wallet.award(stake); ctx.recordResult('tie', 0); setBanner(banner, `Unentschieden (${hostSum}) — Einsatz zurück.`, ''); return; }
       const iAmHost = ctx.duel.isHost();
       const hostWins = hostSum > guestSum;
       const iWin = (iAmHost && hostWins) || (!iAmHost && !hostWins);
-      if (iWin) { ctx.wallet.award(stake * 2); setBanner(banner, `Du gewinnst! (${iAmHost ? hostSum : guestSum} vs ${iAmHost ? guestSum : hostSum})`, 'win'); ctx.playSound('win'); }
-      else { setBanner(banner, `Verloren. (${iAmHost ? hostSum : guestSum} vs ${iAmHost ? guestSum : hostSum})`, 'lose'); ctx.playSound('lose'); }
+      settle(ctx, stake, iWin ? stake * 2 : 0);
+      if (iWin) { ctx.wallet.award(stake * 2); setBanner(banner, `Du gewinnst (${iAmHost ? hostSum : guestSum} gegen ${iAmHost ? guestSum : hostSum}).`, 'win'); ctx.playSound('win'); }
+      else { setBanner(banner, `Verloren (${iAmHost ? hostSum : guestSum} gegen ${iAmHost ? guestSum : hostSum}).`, 'lose'); ctx.playSound('lose'); }
     }
 
     rollBtn.onclick = () => {
       const bet = readBet(container, 'cr-bet', ctx.wallet);
       if (duelMode === 'friend') {
         if (!ctx.duel.isConnected()) { setBanner(banner, 'Nicht verbunden.', 'lose'); return; }
-        if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+        if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
         const mine = root.CrapsEngine.duelRoll();
         diceEl.innerHTML = mine.dice.map(dieHtml).join('');
         duelPending = { hostSum: mine.sum, stake: bet };
@@ -399,21 +420,20 @@
         return;
       }
       if (engine.point === null) {
-        if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+        if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
         engine.reset();
-        const r = engine.start(bet);
-        handleRoll(r);
+        handleRoll(engine.start(bet));
       } else {
-        const r = engine.roll();
-        handleRoll(r);
+        handleRoll(engine.roll());
       }
     };
 
     function handleRoll(r) {
       diceEl.innerHTML = r.dice.map(dieHtml).join('');
       if (r.done) {
-        if (r.outcome === 'win') { ctx.wallet.award(r.payout); setBanner(banner, `${r.sum} — Gewonnen! +${fmt(r.payout)}`, 'win'); ctx.playSound('win'); }
-        else { setBanner(banner, `${r.sum} — Verloren.`, 'lose'); ctx.playSound('lose'); }
+        settle(ctx, engine.bet, r.payout);
+        if (r.outcome === 'win') { ctx.wallet.award(r.payout); setBanner(banner, `${r.sum} — gewonnen, plus ${fmt(r.payout)}`, 'win'); ctx.playSound('win'); }
+        else { setBanner(banner, `${r.sum} — verloren.`, 'lose'); ctx.playSound('lose'); }
         engine.reset();
       } else {
         setBanner(banner, `Punkt: ${r.point}. Wirf erneut — 7 verliert, ${r.point} gewinnt.`, '');
@@ -428,14 +448,14 @@
     const engine = new root.SicBoEngine();
     container.innerHTML = `
       <div class="az-flex-col az-gap-3" style="align-items:center;">
-        <div class="az-flex az-gap-2" id="sb-dice"><div class="az-die">?</div><div class="az-die">?</div><div class="az-die">?</div></div>
+        <div class="az-flex az-gap-2" id="sb-dice"><div class="az-die"></div><div class="az-die"></div><div class="az-die"></div></div>
         ${betControl('sb-bet', 15)}
         <div class="az-choice-row">
           <button class="az-choice-btn az-active" data-bet="big">Groß (11–17)</button>
           <button class="az-choice-btn" data-bet="small">Klein (4–10)</button>
           <button class="az-choice-btn" data-bet="any_triple">Jeder Pasch (×30)</button>
         </div>
-        <button id="sb-roll" class="az-btn az-btn-block">🎲 Würfeln</button>
+        <button id="sb-roll" class="az-btn az-btn-block">Würfeln</button>
         <div class="az-result-banner" id="sb-banner">Groß/Klein gewinnt 2:1, außer bei Pasch.</div>
       </div>`;
     let betType = 'big';
@@ -450,11 +470,12 @@
     const diceEl = container.querySelector('#sb-dice');
     container.querySelector('#sb-roll').onclick = () => {
       const bet = readBet(container, 'sb-bet', ctx.wallet);
-      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
       const r = engine.roll(betType, null, bet);
       diceEl.innerHTML = r.dice.map(dieHtml).join('');
-      if (r.win) { ctx.wallet.award(r.payout); setBanner(banner, `Summe ${r.sum} — Gewonnen! +${fmt(r.payout)}`, 'win'); ctx.playSound('win'); }
-      else { setBanner(banner, `Summe ${r.sum}${r.isTriple ? ' (Pasch)' : ''} — Verloren.`, 'lose'); ctx.playSound('lose'); }
+      settle(ctx, bet, r.payout);
+      if (r.win) { ctx.wallet.award(r.payout); setBanner(banner, `Summe ${r.sum} — gewonnen, plus ${fmt(r.payout)}`, 'win'); ctx.playSound('win'); }
+      else { setBanner(banner, `Summe ${r.sum}${r.isTriple ? ' (Pasch)' : ''} — verloren.`, 'lose'); ctx.playSound('lose'); }
     };
   }
 
@@ -479,7 +500,7 @@
     const streakEl = container.querySelector('#hl-streak');
     const actions = container.querySelector('#hl-actions');
     let duelMode = 'house';
-    let duelStake = 0;
+    let pendingHost = null;
 
     wireDuelToggle(container, ctx, (mode) => {
       duelMode = mode;
@@ -489,7 +510,7 @@
 
     ctx.duel.setHandler((data) => {
       if (data.type === 'hilo_start') {
-        if (!ctx.wallet.place(data.stake)) { setBanner(banner, 'Nicht genug Coins für das Duell!', 'lose'); return; }
+        if (!ctx.wallet.place(data.stake)) { setBanner(banner, 'Nicht genug Coins für das Duell.', 'lose'); return; }
         const deck = root.CardDeck.createShoe(1);
         const myCard = deck.pop();
         cardEl.innerHTML = cardHtml(myCard);
@@ -499,25 +520,25 @@
         resolveDuel(pendingHost.val, data.myVal, pendingHost.stake, pendingHost.card, data.myCard);
       }
     });
-    let pendingHost = null;
 
     function resolveDuel(hostVal, guestVal, stake, hostCard, guestCard) {
       cardEl.innerHTML = cardHtml(hostCard) + cardHtml(guestCard);
-      if (hostVal === guestVal) { ctx.wallet.award(stake); setBanner(banner, 'Unentschieden — Einsatz zurück.', ''); return; }
+      if (hostVal === guestVal) { ctx.wallet.award(stake); ctx.recordResult('tie', 0); setBanner(banner, 'Unentschieden — Einsatz zurück.', ''); return; }
       const iAmHost = ctx.duel.isHost();
       const hostWins = hostVal > guestVal;
       const iWin = (iAmHost && hostWins) || (!iAmHost && !hostWins);
-      if (iWin) { ctx.wallet.award(stake * 2); setBanner(banner, 'Du gewinnst das Duell!', 'win'); ctx.playSound('win'); }
+      settle(ctx, stake, iWin ? stake * 2 : 0);
+      if (iWin) { ctx.wallet.award(stake * 2); setBanner(banner, 'Du gewinnst das Duell.', 'win'); ctx.playSound('win'); }
       else { setBanner(banner, 'Verloren.', 'lose'); ctx.playSound('lose'); }
     }
 
     function resetActions() {
       if (duelMode === 'friend') {
-        actions.innerHTML = `<button id="hl-duel-start" class="az-btn az-btn-block">🌐 Duell starten</button>`;
+        actions.innerHTML = `<button id="hl-duel-start" class="az-btn az-btn-block">Duell starten</button>`;
         container.querySelector('#hl-duel-start').onclick = () => {
           if (!ctx.duel.isConnected()) { setBanner(banner, 'Nicht verbunden.', 'lose'); return; }
           const bet = readBet(container, 'hl-bet', ctx.wallet);
-          if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+          if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
           const deck = root.CardDeck.createShoe(1);
           const myCard = deck.pop();
           cardEl.innerHTML = cardHtml(myCard);
@@ -533,12 +554,12 @@
 
     function startSolo() {
       const bet = readBet(container, 'hl-bet', ctx.wallet);
-      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
       const r = engine.start(bet);
       cardEl.innerHTML = cardHtml(r.card);
       streakEl.textContent = 'Streak: 0';
       setBanner(banner, 'Höher oder niedriger?', '');
-      actions.innerHTML = `<button id="hl-lower" class="az-btn az-btn-secondary">⬇️ Niedriger</button><button id="hl-cash" class="az-btn az-btn-success">💰 Auszahlen</button><button id="hl-higher" class="az-btn">⬆️ Höher</button>`;
+      actions.innerHTML = `<button id="hl-lower" class="az-btn az-btn-secondary">Niedriger</button><button id="hl-cash" class="az-btn az-btn-success">Auszahlen</button><button id="hl-higher" class="az-btn">Höher</button>`;
       container.querySelector('#hl-higher').onclick = () => guess('higher');
       container.querySelector('#hl-lower').onclick = () => guess('lower');
       container.querySelector('#hl-cash').onclick = cashOut;
@@ -549,8 +570,9 @@
       cardEl.innerHTML = cardHtml(r.card);
       if (r.correct) {
         streakEl.textContent = `Streak: ${r.streak} · möglicher Gewinn ${fmt(r.currentPayout)}`;
-        setBanner(banner, 'Richtig! Weiter ziehen oder auszahlen.', 'win');
+        setBanner(banner, 'Richtig — weiter ziehen oder auszahlen.', 'win');
       } else {
+        settle(ctx, engine.bet, 0);
         setBanner(banner, 'Falsch geraten — Einsatz verloren.', 'lose');
         ctx.playSound('lose');
         resetActions();
@@ -559,7 +581,12 @@
 
     function cashOut() {
       const r = engine.cashOut();
-      if (r) { ctx.wallet.award(r.payout); setBanner(banner, `Ausgezahlt: +${fmt(r.payout)} bei Streak ${r.streak}`, 'win'); ctx.playSound('win'); }
+      if (r) {
+        settle(ctx, engine.bet, r.payout);
+        ctx.wallet.award(r.payout);
+        setBanner(banner, `Ausgezahlt: plus ${fmt(r.payout)} bei Streak ${r.streak}`, 'win');
+        ctx.playSound('win');
+      }
       resetActions();
     }
 
@@ -574,7 +601,7 @@
     container.innerHTML = `
       <div class="az-flex-col az-gap-3" style="align-items:center;">
         ${duelToggleHtml(ctx.duel.isConnected())}
-        <div class="az-coin" id="cf-coin">🪙</div>
+        <div class="az-coin" id="cf-coin">${Icon('coin', { size: 26 })}</div>
         <div class="az-text-footnote" id="cf-hint">Wähle Kopf oder Zahl.</div>
         ${betControl('cf-bet', 10)}
         <div class="az-choice-row" id="cf-choices">
@@ -602,48 +629,50 @@
     wireDuelToggle(container, ctx, (mode) => {
       duelMode = mode;
       choices.style.display = mode === 'friend' ? 'none' : 'flex';
-      flipBtn.textContent = mode === 'friend' ? '🌐 Duell starten (du = Kopf)' : 'Werfen';
+      flipBtn.textContent = mode === 'friend' ? 'Duell starten (du bist Kopf)' : 'Werfen';
       hint.textContent = mode === 'friend' ? 'Host ist immer Kopf, Freund ist Zahl.' : 'Wähle Kopf oder Zahl.';
     });
 
     ctx.duel.setHandler((data) => {
       if (data.type !== 'coinflip_start') return;
-      if (!ctx.wallet.place(data.stake)) { setBanner(banner, 'Nicht genug Coins für das Duell!', 'lose'); return; }
-      animateCoin(data.result, () => {
+      if (!ctx.wallet.place(data.stake)) { setBanner(banner, 'Nicht genug Coins für das Duell.', 'lose'); return; }
+      animateCoin(() => {
         const iWin = data.result === 'tails'; // guest is always "tails"
-        if (iWin) { ctx.wallet.award(data.stake * 2); setBanner(banner, `${data.result === 'heads' ? 'Kopf' : 'Zahl'}! Du gewinnst!`, 'win'); ctx.playSound('win'); }
-        else { setBanner(banner, `${data.result === 'heads' ? 'Kopf' : 'Zahl'}! Verloren.`, 'lose'); ctx.playSound('lose'); }
+        settle(ctx, data.stake, iWin ? data.stake * 2 : 0);
+        const side = data.result === 'heads' ? 'Kopf' : 'Zahl';
+        if (iWin) { ctx.wallet.award(data.stake * 2); setBanner(banner, `${side} — du gewinnst.`, 'win'); ctx.playSound('win'); }
+        else { setBanner(banner, `${side} — verloren.`, 'lose'); ctx.playSound('lose'); }
       });
     });
 
-    function animateCoin(result, done) {
+    function animateCoin(done) {
       coinEl.classList.add('az-flipping');
-      setTimeout(() => {
-        coinEl.classList.remove('az-flipping');
-        coinEl.textContent = result === 'heads' ? '👑' : '🔢';
-        done();
-      }, 600);
+      setTimeout(() => { coinEl.classList.remove('az-flipping'); done(); }, 600);
     }
 
     flipBtn.onclick = () => {
       const bet = readBet(container, 'cf-bet', ctx.wallet);
       if (duelMode === 'friend') {
         if (!ctx.duel.isConnected()) { setBanner(banner, 'Nicht verbunden.', 'lose'); return; }
-        if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+        if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
         const result = root.CoinFlipEngine.duelFlip();
         ctx.duel.send('coinflip_start', { stake: bet, result });
-        animateCoin(result, () => {
+        animateCoin(() => {
           const iWin = result === 'heads'; // host is always "heads"
-          if (iWin) { ctx.wallet.award(bet * 2); setBanner(banner, `${result === 'heads' ? 'Kopf' : 'Zahl'}! Du gewinnst!`, 'win'); ctx.playSound('win'); }
-          else { setBanner(banner, `${result === 'heads' ? 'Kopf' : 'Zahl'}! Verloren.`, 'lose'); ctx.playSound('lose'); }
+          settle(ctx, bet, iWin ? bet * 2 : 0);
+          const side = result === 'heads' ? 'Kopf' : 'Zahl';
+          if (iWin) { ctx.wallet.award(bet * 2); setBanner(banner, `${side} — du gewinnst.`, 'win'); ctx.playSound('win'); }
+          else { setBanner(banner, `${side} — verloren.`, 'lose'); ctx.playSound('lose'); }
         });
         return;
       }
-      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
       const r = engine.flip(call, bet);
-      animateCoin(r.result, () => {
-        if (r.win) { ctx.wallet.award(r.payout); setBanner(banner, `${r.result === 'heads' ? 'Kopf' : 'Zahl'}! Gewonnen! +${fmt(r.payout)}`, 'win'); ctx.playSound('win'); }
-        else { setBanner(banner, `${r.result === 'heads' ? 'Kopf' : 'Zahl'}! Verloren.`, 'lose'); ctx.playSound('lose'); }
+      animateCoin(() => {
+        settle(ctx, bet, r.payout);
+        const side = r.result === 'heads' ? 'Kopf' : 'Zahl';
+        if (r.win) { ctx.wallet.award(r.payout); setBanner(banner, `${side} — gewonnen, plus ${fmt(r.payout)}`, 'win'); ctx.playSound('win'); }
+        else { setBanner(banner, `${side} — verloren.`, 'lose'); ctx.playSound('lose'); }
       });
     };
   }
@@ -662,7 +691,7 @@
         </div>
         <div class="az-flex az-gap-1" id="pl-buckets"></div>
         ${betControl('pl-bet', 10)}
-        <button id="pl-drop" class="az-btn az-btn-block">⬇️ Ball fallen lassen</button>
+        <button id="pl-drop" class="az-btn az-btn-block">Ball fallen lassen</button>
         <div class="az-result-banner" id="pl-banner">Wähle dein Risiko.</div>
       </div>`;
     let risk = 'low';
@@ -685,14 +714,15 @@
 
     container.querySelector('#pl-drop').onclick = () => {
       const bet = readBet(container, 'pl-bet', ctx.wallet);
-      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
       const r = engine.drop(bet, risk);
       ctx.playSound('spin');
       setTimeout(() => {
         renderBuckets(r.bucket);
-        if (r.payout > bet) { ctx.wallet.award(r.payout); setBanner(banner, `${r.multiplier}× Feld — Gewonnen! +${fmt(r.payout)}`, 'win'); ctx.playSound('win'); }
+        settle(ctx, bet, r.payout);
+        if (r.payout > bet) { ctx.wallet.award(r.payout); setBanner(banner, `${r.multiplier}× Feld — gewonnen, plus ${fmt(r.payout)}`, 'win'); ctx.playSound('win'); }
         else if (r.payout === bet) { ctx.wallet.award(r.payout); setBanner(banner, `${r.multiplier}× Feld — Einsatz zurück.`, ''); }
-        else { setBanner(banner, `${r.multiplier}× Feld — Verloren.`, 'lose'); ctx.playSound('lose'); }
+        else { setBanner(banner, `${r.multiplier}× Feld — verloren.`, 'lose'); ctx.playSound('lose'); }
       }, 500);
     };
   }
@@ -706,8 +736,8 @@
       <div class="az-flex-col az-gap-3" style="align-items:center;">
         <div class="az-wheel-track" id="wh-track"></div>
         ${betControl('wh-bet', 15)}
-        <button id="wh-spin" class="az-btn az-btn-block">🎡 Glücksrad drehen</button>
-        <div class="az-result-banner" id="wh-banner">Triff dein Glück!</div>
+        <button id="wh-spin" class="az-btn az-btn-block">Glücksrad drehen</button>
+        <div class="az-result-banner" id="wh-banner">Triff dein Glück.</div>
       </div>`;
     const track = container.querySelector('#wh-track');
     const banner = container.querySelector('#wh-banner');
@@ -717,7 +747,7 @@
     renderTrack();
     container.querySelector('#wh-spin').onclick = () => {
       const bet = readBet(container, 'wh-bet', ctx.wallet);
-      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
       ctx.playSound('spin');
       let ticks = 0;
       const iv = setInterval(() => {
@@ -727,25 +757,26 @@
           clearInterval(iv);
           const r = engine.spin(bet);
           renderTrack(r.index);
-          if (r.payout > bet) { ctx.wallet.award(r.payout); setBanner(banner, `${r.multiplier}× — Gewonnen! +${fmt(r.payout)}`, 'win'); ctx.playSound('win'); }
+          settle(ctx, bet, r.payout);
+          if (r.payout > bet) { ctx.wallet.award(r.payout); setBanner(banner, `${r.multiplier}× — gewonnen, plus ${fmt(r.payout)}`, 'win'); ctx.playSound('win'); }
           else if (r.payout === bet) { ctx.wallet.award(r.payout); setBanner(banner, `${r.multiplier}× — Einsatz zurück.`, ''); }
-          else { setBanner(banner, `${r.multiplier}× — Verloren.`, 'lose'); ctx.playSound('lose'); }
+          else { setBanner(banner, `${r.multiplier}× — verloren.`, 'lose'); ctx.playSound('lose'); }
         }
       }, 90);
     };
   }
 
   root.CASINO_GAMES = [
-    { id: 'slot', icon: '🎰', title: 'Spielautomat', render: renderSlot },
-    { id: 'blackjack', icon: '🃏', title: 'Blackjack', render: renderBlackjack },
-    { id: 'roulette', icon: '🎡', title: 'Roulette', render: renderRoulette },
-    { id: 'videopoker', icon: '🂡', title: 'Video Poker', render: renderVideoPoker },
-    { id: 'baccarat', icon: '🎴', title: 'Baccarat', render: renderBaccarat },
-    { id: 'craps', icon: '🎲', title: 'Craps', duel: true, render: renderCraps },
-    { id: 'sicbo', icon: '🀄', title: 'Sic Bo', render: renderSicBo },
-    { id: 'higherlower', icon: '🔀', title: 'Höher/Tiefer', duel: true, render: renderHigherLower },
-    { id: 'coinflip', icon: '🪙', title: 'Münzwurf', duel: true, render: renderCoinFlip },
-    { id: 'plinko', icon: '⚪', title: 'Plinko', render: renderPlinko },
-    { id: 'wheel', icon: '🎯', title: 'Glücksrad', render: renderWheel }
+    { id: 'slot', icon: 'slot', title: 'Spielautomat', render: renderSlot },
+    { id: 'blackjack', icon: 'cards', title: 'Blackjack', render: renderBlackjack },
+    { id: 'roulette', icon: 'target', title: 'Roulette', render: renderRoulette },
+    { id: 'videopoker', icon: 'cards', title: 'Video Poker', render: renderVideoPoker },
+    { id: 'baccarat', icon: 'cards', title: 'Baccarat', render: renderBaccarat },
+    { id: 'craps', icon: 'dice', title: 'Craps', duel: true, render: renderCraps },
+    { id: 'sicbo', icon: 'dice', title: 'Sic Bo', render: renderSicBo },
+    { id: 'higherlower', icon: 'cards', title: 'Höher/Tiefer', duel: true, render: renderHigherLower },
+    { id: 'coinflip', icon: 'coin', title: 'Münzwurf', duel: true, render: renderCoinFlip },
+    { id: 'plinko', icon: 'drop', title: 'Plinko', render: renderPlinko },
+    { id: 'wheel', icon: 'wheel', title: 'Glücksrad', render: renderWheel }
   ];
 })(typeof window !== 'undefined' ? window : globalThis);

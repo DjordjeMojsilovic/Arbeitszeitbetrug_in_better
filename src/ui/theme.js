@@ -63,6 +63,7 @@
   }
 
   .az-root, .az-root * { box-sizing: border-box; }
+  .az-root .az-hidden { display: none !important; }
 
   .az-text-large-title { font-size: 28px; font-weight: 700; letter-spacing: -0.3px; }
   .az-text-title2 { font-size: 20px; font-weight: 700; }
@@ -204,6 +205,54 @@
   .az-gap-1 { gap: var(--az-space-1); }
   .az-gap-2 { gap: var(--az-space-2); }
   .az-gap-3 { gap: var(--az-space-3); }
+
+  /* Icon buttons & generic controls */
+  .az-icon-btn { display:flex; align-items:center; justify-content:center; }
+  .az-btn .az-icon-inline { margin-right: 2px; }
+
+  /* Responsive board grids — scale with container width instead of fixed px */
+  .az-board-wrap { width: 100%; display: flex; justify-content: center; }
+  .az-board-wrap > * { width: 100%; display: flex; justify-content: center; }
+  .az-ttt-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; width: 100%; max-width: 260px; aspect-ratio: 1; }
+  .az-ttt-cell {
+    background: var(--az-fill); border-radius: var(--az-radius-sm);
+    display: flex; align-items: center; justify-content: center;
+    font-size: clamp(20px, 8vw, 30px); font-weight: 800; cursor: pointer;
+    aspect-ratio: 1;
+  }
+  .az-ttt-cell.az-win { background: rgba(52,199,89,0.25); }
+
+  .az-c4-wrap { display: flex; flex-direction: column; align-items: center; gap: 4px; width: 100%; max-width: 320px; }
+  .az-c4-drops { display: grid; grid-template-columns: repeat(7, 1fr); gap: 3px; width: 100%; }
+  .az-c4-drop-btn { min-height: 28px; background: transparent; border: none; color: var(--az-secondary-label); cursor: pointer; display:flex; align-items:center; justify-content:center; border-radius: 6px; }
+  .az-c4-drop-btn:hover { background: var(--az-fill); color: var(--az-label); }
+  .az-c4-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; width: 100%; background: var(--az-grouped-bg); padding: 6px; border-radius: var(--az-radius-sm); }
+  .az-c4-cell { aspect-ratio: 1; border-radius: 50%; background: var(--az-bg); border: 1px solid var(--az-separator); }
+  .az-c4-cell.az-p1 { background: var(--az-blue); }
+  .az-c4-cell.az-p2 { background: var(--az-red); }
+
+  .az-chess-grid { display: grid; grid-template-columns: repeat(8, 1fr); width: 100%; max-width: 320px; aspect-ratio: 1; border-radius: 8px; overflow: hidden; border: 1px solid var(--az-separator); }
+  .az-chess-cell { display: flex; align-items: center; justify-content: center; font-size: clamp(14px, 4.4vw, 22px); cursor: pointer; aspect-ratio: 1; }
+  .az-chess-cell.az-light { background: #e5e5ea; }
+  .az-chess-cell.az-dark { background: #48484a; }
+  .az-chess-cell.az-selected { background: var(--az-blue) !important; }
+  .az-chess-cell.az-valid { background: rgba(52,199,89,0.45) !important; }
+  .az-chess-piece-w { color: #0a84ff; }
+  .az-chess-piece-b { color: #ff453a; }
+
+  /* Leaderboard */
+  .az-leaderboard-row {
+    display: flex; align-items: center; gap: var(--az-space-2);
+    padding: var(--az-space-2); border-radius: var(--az-radius-sm); background: var(--az-fill);
+  }
+  .az-leaderboard-row.az-me { border: 1.5px solid var(--az-blue); }
+  .az-lb-rank { width: 22px; text-align: center; font-weight: 800; color: var(--az-secondary-label); flex-shrink: 0; }
+  .az-lb-info { flex: 1; min-width: 0; }
+  .az-lb-name { font-weight: 700; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .az-lb-meta { font-size: 11px; color: var(--az-secondary-label); font-family: 'SF Mono', ui-monospace, monospace; }
+  .az-lb-score { font-weight: 800; font-size: 15px; flex-shrink: 0; }
+  .az-lb-score.az-positive { color: var(--az-green); }
+  .az-lb-score.az-negative { color: var(--az-red); }
 
   /* Casino-specific components */
   .az-playing-card {

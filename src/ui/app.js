@@ -2,13 +2,14 @@
  * ArcadeApp — the shared application shell.
  * Renders into either a floating Shadow DOM widget (browser extension /
  * Tampermonkey userscript) or a full page (standalone web app / PWA).
- * Owns the board-game tab, the Casino tab, the shared P2P connection and
- * the shared casino wallet.
+ * Owns the board-game tab, the Casino tab, the leaderboard/network tab,
+ * the shared P2P connection and the shared casino wallet.
  */
 (function (root) {
   'use strict';
 
   const STATE_KEY = 'arcade_app_state_v5';
+  const Icon = (name, opts) => window.AZIcon(name, opts);
 
   class SoundEngine {
     constructor() { this.muted = true; }
@@ -52,7 +53,11 @@
       this.p2p = new window.P2PNetworkManager();
       this.username = `Spieler${Math.floor(100 + Math.random() * 900)}`;
 
-      this.activeTab = 'arcade'; // 'arcade' | 'casino'
+      this.ledger = null; // PlayerLedger, loaded asynchronously
+      this._pendingResults = []; // queued until the ledger finishes loading
+      this.network = new window.NetworkLedger();
+
+      this.activeTab = 'arcade'; // 'arcade' | 'casino' | 'leaderboard'
       this.activeBoardGame = 'tictactoe';
       this.boardMode = 'ai'; // 'ai' | 'local' | 'p2p'
       this.activeCasinoGame = null;
@@ -63,21 +68,21 @@
       this.ttt = new window.TicTacToeEngine();
       this.c4 = new window.Connect4Engine();
       this.chess = new window.ChessEngine();
-      this.scores = { tictactoe: [0, 0], connect4: [0, 0] };
 
       this._bindP2P();
       this.wallet.onChange((bal) => {
         this.root.querySelectorAll('[data-wallet-badge]').forEach(el => {
-          el.textContent = `${bal.toLocaleString('de-DE')} Coins`;
+          el.textContent = `${bal.toLocaleString('de-DE')}`;
         });
       });
     }
 
     _bindP2P() {
       this.p2p.callbacks.onConnected = () => {
-        this.updateSocialStatus('✅ Verbunden!');
+        this.updateSocialStatus('Verbunden.');
         this.boardMode = 'p2p';
         this.resetActiveBoardGame();
+        this._sendLedgerSync();
         this.render();
       };
       this.p2p.callbacks.onDisconnected = () => {
@@ -85,13 +90,38 @@
         this.boardMode = 'ai';
         this.render();
       };
-      this.p2p.callbacks.onError = (msg) => this.updateSocialStatus('❌ ' + msg);
+      this.p2p.callbacks.onError = (msg) => this.updateSocialStatus(msg);
       this.p2p.callbacks.onData = (data) => {
         if (!data || !data.type) return;
-        if (data.type === 'HANDSHAKE') { this.updateSocialStatus(`✅ ${data.name || 'Verbunden'}`); return; }
+        if (data.type === 'HANDSHAKE') { this.updateSocialStatus(`Verbunden mit ${data.name || 'Mitspieler'}`); return; }
         if (data.scope === 'board') { this._handleBoardData(data); return; }
         if (data.scope === 'casino' && this.casinoDuelHandler) { this.casinoDuelHandler(data); return; }
+        if (data.scope === 'ledger' && data.type === 'SYNC') { this._receiveLedgerSync(data.payload); return; }
       };
+    }
+
+    async _sendLedgerSync() {
+      if (!this.ledger) return;
+      this.network.setLocal(this.ledger.deviceId, this.username, this.ledger.chain);
+      this.p2p.send({ scope: 'ledger', type: 'SYNC', payload: this.network.exportPayload() });
+    }
+
+    async _receiveLedgerSync(payload) {
+      const { learned, updated } = await this.network.mergeAll(payload);
+      if (learned || updated) {
+        // Gossip forward: reply with our (now larger) network view so both
+        // sides converge even if the peer only knew a subset.
+        this.p2p.send({ scope: 'ledger', type: 'SYNC', payload: this.network.exportPayload() });
+        if (this.activeTab === 'leaderboard') this._renderBody();
+      }
+    }
+
+    async _recordResult(game, result, delta) {
+      if (!this.ledger) { this._pendingResults.push([game, result, delta]); return; }
+      await this.ledger.addResult(game, result, delta || 0);
+      this.network.setLocal(this.ledger.deviceId, this.username, this.ledger.chain);
+      if (this.p2p.isConnected()) this._sendLedgerSync();
+      if (this.activeTab === 'leaderboard') this._renderBody();
     }
 
     updateSocialStatus(text) {
@@ -99,34 +129,41 @@
       if (el) el.textContent = text;
     }
 
-    mount() {
+    async mount() {
       this.render();
+      this.ledger = await window.PlayerLedger.load(this.username);
+      await this.network.load();
+      const queued = this._pendingResults.splice(0);
+      for (const [game, result, delta] of queued) await this.ledger.addResult(game, result, delta || 0);
+      this.network.setLocal(this.ledger.deviceId, this.username, this.ledger.chain);
+      if (this.p2p.isConnected()) this._sendLedgerSync();
+      if (this.activeTab === 'leaderboard') this._renderBody();
     }
 
     render() {
       const isFloating = this.mode === 'floating';
       this.root.innerHTML = `
         <div class="az-root ${isFloating ? 'az-floating-root' : 'az-fullpage-root'}">
-          ${isFloating ? `<button id="az-pill" class="az-pill ${this.isCollapsed ? '' : 'az-hidden'}">🎮 Arcade</button>` : ''}
+          ${isFloating ? `<button id="az-pill" class="az-pill ${this.isCollapsed ? '' : 'az-hidden'}">${Icon('controller', { size: 18 })}<span>Arcade</span></button>` : ''}
           <div id="az-window" class="az-window az-glass ${this.isCollapsed ? 'az-hidden' : ''}">
             <div id="az-header" class="az-header">
-              <div class="az-text-title3">🎮 Arbeitszeitbetrug Arcade</div>
+              <div class="az-flex az-gap-2 az-text-title3">${Icon('controller', { size: 20 })}<span>Arbeitszeitbetrug</span></div>
               <div class="az-flex az-gap-1">
-                <button id="az-btn-social" class="az-btn az-btn-icon" title="Online spielen">🌐</button>
-                <button id="az-btn-sound" class="az-btn az-btn-icon" title="Ton">${this.sound.muted ? '🔇' : '🔊'}</button>
-                ${isFloating ? '<button id="az-btn-min" class="az-btn az-btn-icon" title="Minimieren">—</button>' : ''}
+                <button id="az-btn-social" class="az-btn az-btn-icon" title="Online spielen">${Icon('globe')}</button>
+                <button id="az-btn-sound" class="az-btn az-btn-icon" title="Ton">${Icon(this.sound.muted ? 'speakerMute' : 'speaker')}</button>
+                ${isFloating ? `<button id="az-btn-min" class="az-btn az-btn-icon" title="Minimieren">${Icon('minus')}</button>` : ''}
               </div>
             </div>
 
             <div id="az-social" class="az-card az-social-panel ${this.socialOpen ? '' : 'az-hidden'}">
               <div class="az-flex-between">
-                <span class="az-text-headline">🌐 Online P2P (kein Server nötig)</span>
-                <span id="az-social-status" class="az-text-footnote">${this.p2p.isConnected() ? '✅ Verbunden' : 'Offline'}</span>
+                <span class="az-flex az-gap-1 az-text-headline">${Icon('globe', { size: 15 })}<span>Online P2P — kein Server nötig</span></span>
+                <span id="az-social-status" class="az-text-footnote">${this.p2p.isConnected() ? 'Verbunden' : 'Offline'}</span>
               </div>
               <div class="az-flex az-gap-2" style="margin-top:8px;">
                 <input id="az-username" class="az-input" style="flex:1;" maxlength="14" value="${this.username}" placeholder="Dein Name">
               </div>
-              <div class="az-flex az-gap-2" style="margin-top:8px;">
+              <div class="az-flex az-gap-2" style="margin-top:8px;flex-wrap:wrap;">
                 <button id="az-btn-host" class="az-btn az-btn-secondary az-btn-sm">PIN erstellen</button>
                 <input id="az-pin-input" class="az-input" style="width:80px;" maxlength="4" placeholder="PIN">
                 <button id="az-btn-join" class="az-btn az-btn-sm">Beitreten</button>
@@ -136,8 +173,9 @@
             </div>
 
             <div class="az-segmented" style="margin: var(--az-space-2) var(--az-space-3) 0;">
-              <button data-tab="arcade" class="${this.activeTab === 'arcade' ? 'az-active' : ''}">🎮 Arcade</button>
-              <button data-tab="casino" class="${this.activeTab === 'casino' ? 'az-active' : ''}">🎰 Casino</button>
+              <button data-tab="arcade" class="az-flex az-gap-1 ${this.activeTab === 'arcade' ? 'az-active' : ''}">${Icon('controller', { size: 15 })}<span>Arcade</span></button>
+              <button data-tab="casino" class="az-flex az-gap-1 ${this.activeTab === 'casino' ? 'az-active' : ''}">${Icon('coin', { size: 15 })}<span>Casino</span></button>
+              <button data-tab="leaderboard" class="az-flex az-gap-1 ${this.activeTab === 'leaderboard' ? 'az-active' : ''}">${Icon('trophy', { size: 15 })}<span>Rangliste</span></button>
             </div>
 
             <div id="az-body" class="az-scroll" style="flex:1; padding: var(--az-space-3);"></div>
@@ -158,7 +196,7 @@
 
       r.querySelector('#az-btn-sound').onclick = () => {
         this.sound.muted = !this.sound.muted;
-        r.querySelector('#az-btn-sound').textContent = this.sound.muted ? '🔇' : '🔊';
+        r.querySelector('#az-btn-sound').innerHTML = Icon(this.sound.muted ? 'speakerMute' : 'speaker');
       };
 
       r.querySelector('#az-btn-social').onclick = () => { this.socialOpen = !this.socialOpen; this.render(); };
@@ -168,7 +206,7 @@
       });
 
       if (this.socialOpen) {
-        r.querySelector('#az-username').oninput = (e) => { this.username = e.target.value; };
+        r.querySelector('#az-username').oninput = (e) => { this.username = e.target.value; if (this.ledger) this.ledger.setName(this.username); };
         r.querySelector('#az-btn-host').onclick = () => {
           const code = this.p2p.hostRoom(this.username);
           r.querySelector('#az-pin-display').textContent = `PIN: ${code} — an Freund weitergeben`;
@@ -186,10 +224,9 @@
 
     _makeDraggable() {
       if (this.mode !== 'floating') return;
-      const win = this.root.querySelector('#az-window');
       const header = this.root.querySelector('#az-header');
       const hostEl = this.hostElement;
-      if (!win || !header || !hostEl) return;
+      if (!header || !hostEl) return;
       let dragging = false, sx = 0, sy = 0, il = 0, it = 0;
       header.onmousedown = (e) => {
         if (e.target.closest('button')) return;
@@ -218,36 +255,38 @@
       }
     }
 
+    _renderBody() {
+      const body = this.root.querySelector('#az-body');
+      if (!body) return;
+      if (this.activeTab === 'arcade') this._renderArcade(body);
+      else if (this.activeTab === 'casino') this._renderCasino(body);
+      else this._renderLeaderboard(body);
+    }
+
     // ==========================================================
     // ARCADE TAB (Board games)
     // ==========================================================
-    _renderBody() {
-      const body = this.root.querySelector('#az-body');
-      if (this.activeTab === 'arcade') this._renderArcade(body);
-      else this._renderCasino(body);
-    }
-
     _renderArcade(body) {
       const games = [
-        { id: 'tictactoe', icon: '❌⭕', label: 'Tic-Tac-Toe' },
-        { id: 'connect4', icon: '🔴🟡', label: '4 Gewinnt' },
-        { id: 'chess', icon: '♟️', label: 'Schach' }
+        { id: 'tictactoe', icon: 'grid', label: 'Tic-Tac-Toe' },
+        { id: 'connect4', icon: 'discs', label: '4 Gewinnt' },
+        { id: 'chess', icon: 'crown', label: 'Schach' }
       ];
       body.innerHTML = `
         <div class="az-flex-col az-gap-3">
           <div class="az-segmented">
-            ${games.map(g => `<button data-game="${g.id}" class="${this.activeBoardGame === g.id ? 'az-active' : ''}">${g.icon} ${g.label}</button>`).join('')}
+            ${games.map(g => `<button data-game="${g.id}" class="az-flex az-gap-1 ${this.activeBoardGame === g.id ? 'az-active' : ''}">${Icon(g.icon, { size: 15 })}<span>${g.label}</span></button>`).join('')}
           </div>
-          <div class="az-flex-between">
-            <div class="az-segmented" style="max-width:220px;">
-              <button data-mode="ai" class="${this.boardMode === 'ai' ? 'az-active' : ''}">🤖 KI</button>
-              <button data-mode="local" class="${this.boardMode === 'local' ? 'az-active' : ''}">👥 Lokal</button>
-              <button data-mode="p2p" class="${this.boardMode === 'p2p' ? 'az-active' : ''}" ${this.p2p.isConnected() ? '' : 'disabled'}>🌐 Online</button>
+          <div class="az-flex-between" style="flex-wrap:wrap;gap:8px;">
+            <div class="az-segmented" style="max-width:240px;">
+              <button data-mode="ai" class="az-flex az-gap-1 ${this.boardMode === 'ai' ? 'az-active' : ''}">${Icon('bot', { size: 14 })}<span>KI</span></button>
+              <button data-mode="local" class="az-flex az-gap-1 ${this.boardMode === 'local' ? 'az-active' : ''}">${Icon('users', { size: 14 })}<span>Lokal</span></button>
+              <button data-mode="p2p" class="az-flex az-gap-1 ${this.boardMode === 'p2p' ? 'az-active' : ''}" ${this.p2p.isConnected() ? '' : 'disabled'}>${Icon('globe', { size: 14 })}<span>Online</span></button>
             </div>
-            <button id="az-board-reset" class="az-btn az-btn-secondary az-btn-sm">🔄 Neu</button>
+            <button id="az-board-reset" class="az-btn az-btn-secondary az-btn-sm az-flex az-gap-1">${Icon('refresh', { size: 14 })}<span>Neu</span></button>
           </div>
           <div id="az-board-status" class="az-result-banner"></div>
-          <div id="az-board-arena" class="az-flex" style="justify-content:center;"></div>
+          <div class="az-board-wrap"><div id="az-board-arena"></div></div>
         </div>`;
 
       body.querySelectorAll('[data-game]').forEach(btn => btn.onclick = () => {
@@ -283,30 +322,31 @@
       if (!arena) return;
 
       if (this.activeBoardGame === 'tictactoe') {
-        arena.innerHTML = `<div style="display:grid;grid-template-columns:repeat(3,56px);gap:6px;">
-          ${this.ttt.board.map((v, i) => `<div data-i="${i}" class="az-card" style="width:56px;height:56px;display:flex;align-items:center;justify-content:center;font-size:26px;font-weight:800;cursor:pointer;${this.ttt.winningLine && this.ttt.winningLine.includes(i) ? 'background:rgba(52,199,89,0.25);' : ''}color:${v === 'X' ? 'var(--az-blue)' : 'var(--az-red)'}">${v}</div>`).join('')}
+        arena.innerHTML = `<div class="az-ttt-grid">
+          ${this.ttt.board.map((v, i) => {
+            const isWin = this.ttt.winningLine && this.ttt.winningLine.includes(i);
+            const color = v === 'X' ? 'var(--az-blue)' : 'var(--az-red)';
+            return `<div data-i="${i}" class="az-ttt-cell ${isWin ? 'az-win' : ''}" style="color:${color}">${v}</div>`;
+          }).join('')}
         </div>`;
         arena.querySelectorAll('[data-i]').forEach(cell => cell.onclick = () => this._playTTT(parseInt(cell.getAttribute('data-i'), 10)));
         status.textContent = this._boardStatusText('ttt');
       } else if (this.activeBoardGame === 'connect4') {
-        arena.innerHTML = `<div class="az-flex-col az-gap-1" style="align-items:center;">
-          <div style="display:grid;grid-template-columns:repeat(7,32px);gap:3px;">
-            ${Array(7).fill(0).map((_, c) => `<button data-c="${c}" class="az-btn az-btn-plain" style="min-height:24px;padding:0;">▼</button>`).join('')}
-          </div>
-          <div style="display:grid;grid-template-columns:repeat(7,32px);gap:3px;background:var(--az-grouped-bg);padding:6px;border-radius:10px;">
-            ${this.c4.board.flat().map((v, i) => `<div class="az-card" style="width:32px;height:32px;border-radius:50%;padding:0;background:${v === 1 ? '#06b6d4' : v === 2 ? '#f43f5e' : 'var(--az-bg)'}"></div>`).join('')}
-          </div>
+        arena.innerHTML = `<div class="az-c4-wrap">
+          <div class="az-c4-drops">${Array(7).fill(0).map((_, c) => `<button data-c="${c}" class="az-c4-drop-btn">▾</button>`).join('')}</div>
+          <div class="az-c4-grid">${this.c4.board.flat().map((v) => `<div class="az-c4-cell ${v === 1 ? 'az-p1' : v === 2 ? 'az-p2' : ''}"></div>`).join('')}</div>
         </div>`;
         arena.querySelectorAll('[data-c]').forEach(btn => btn.onclick = () => this._playC4(parseInt(btn.getAttribute('data-c'), 10)));
         status.textContent = this._boardStatusText('c4');
       } else {
-        arena.innerHTML = `<div style="display:grid;grid-template-columns:repeat(8,32px);">
+        arena.innerHTML = `<div class="az-chess-grid">
           ${this.chess.board.flat().map((p, i) => {
             const r = Math.floor(i / 8), c = i % 8;
             const light = (r + c) % 2 === 0;
             const isSel = this.chess.selected && this.chess.selected.r === r && this.chess.selected.c === c;
             const isValid = this.chess.validMoves.some(m => m.r === r && m.c === c);
-            return `<div data-r="${r}" data-c="${c}" style="width:32px;height:32px;display:flex;align-items:center;justify-content:center;font-size:20px;cursor:pointer;background:${isSel ? 'var(--az-blue)' : isValid ? 'rgba(52,199,89,0.4)' : light ? '#e5e5ea' : '#3a3a3c'};color:${this.chess.isWhite(p) ? '#0a84ff' : '#ff453a'}">${p}</div>`;
+            const cls = ['az-chess-cell', light ? 'az-light' : 'az-dark', isSel ? 'az-selected' : '', isValid ? 'az-valid' : '', this.chess.isWhite(p) ? 'az-chess-piece-w' : this.chess.isBlack(p) ? 'az-chess-piece-b' : ''].join(' ');
+            return `<div data-r="${r}" data-c="${c}" class="${cls}">${p}</div>`;
           }).join('')}
         </div>`;
         arena.querySelectorAll('[data-r]').forEach(cell => cell.onclick = () => this._playChess(parseInt(cell.getAttribute('data-r'), 10), parseInt(cell.getAttribute('data-c'), 10)));
@@ -316,15 +356,24 @@
 
     _boardStatusText(game) {
       if (game === 'ttt') {
-        if (this.ttt.winner) return this.ttt.winner === 'TIE' ? 'Unentschieden!' : `${this.ttt.winner} gewinnt! 🎉`;
+        if (this.ttt.winner) return this.ttt.winner === 'TIE' ? 'Unentschieden.' : `${this.ttt.winner} gewinnt.`;
         return this.boardMode === 'p2p' ? (this.isMyTurn ? 'Du bist dran' : 'Gegner ist dran') : `${this.ttt.turn} ist dran`;
       }
       if (game === 'c4') {
-        if (this.c4.winner) return this.c4.winner === 'TIE' ? 'Unentschieden!' : `Spieler ${this.c4.winner} gewinnt! 🎉`;
+        if (this.c4.winner) return this.c4.winner === 'TIE' ? 'Unentschieden.' : `Spieler ${this.c4.winner} gewinnt.`;
         return this.boardMode === 'p2p' ? (this.isMyTurn ? 'Du bist dran' : 'Gegner ist dran') : `Spieler ${this.c4.turn} ist dran`;
       }
-      if (this.chess.winner) return `${this.chess.winner} gewinnt! ♚🎉`;
+      if (this.chess.winner) return `${this.chess.winner} gewinnt.`;
       return this.boardMode === 'p2p' ? (this.isMyTurn ? 'Du bist dran' : 'Gegner ist dran') : (this.chess.turn === 'w' ? 'Weiß ist dran' : 'Schwarz ist dran');
+    }
+
+    /** Only AI and Online modes have a well-defined "me" to score; local pass-and-play is shared. */
+    _maybeRecordBoard(game, winner, meIsFirstSide) {
+      if (this.boardMode === 'local') return;
+      if (winner === 'TIE') { this._recordResult(game, 'tie', 0); return; }
+      const iAmFirstSide = this.boardMode === 'ai' ? true : this.p2p.isHost;
+      const iWon = meIsFirstSide === iAmFirstSide;
+      this._recordResult(game, iWon ? 'win' : 'lose', 0);
     }
 
     _playTTT(i, fromRemote = false) {
@@ -335,11 +384,18 @@
       if (this.boardMode === 'p2p' && !fromRemote) { this.p2p.send({ scope: 'board', type: 'MOVE', game: 'ttt', i }); this.isMyTurn = false; }
       else if (this.boardMode === 'p2p' && fromRemote) this.isMyTurn = true;
       this._renderBoardArena();
-      if (this.ttt.winner) { this.sound.play(this.ttt.winner === 'TIE' ? 'click' : 'win'); return; }
+      if (this.ttt.winner) {
+        this.sound.play(this.ttt.winner === 'TIE' ? 'click' : 'win');
+        this._maybeRecordBoard('tictactoe', this.ttt.winner, this.ttt.winner === 'X');
+        return;
+      }
       if (this.boardMode === 'ai' && this.ttt.turn === 'O') {
         setTimeout(() => {
           const ai = this.ttt.getAIMove('hard');
-          if (ai !== null) { this.ttt.move(ai); this.sound.play('move'); this._renderBoardArena(); if (this.ttt.winner) this.sound.play(this.ttt.winner === 'TIE' ? 'click' : 'lose'); }
+          if (ai !== null) {
+            this.ttt.move(ai); this.sound.play('move'); this._renderBoardArena();
+            if (this.ttt.winner) { this.sound.play(this.ttt.winner === 'TIE' ? 'click' : 'lose'); this._maybeRecordBoard('tictactoe', this.ttt.winner, this.ttt.winner === 'X'); }
+          }
         }, 350);
       }
     }
@@ -352,11 +408,18 @@
       if (this.boardMode === 'p2p' && !fromRemote) { this.p2p.send({ scope: 'board', type: 'MOVE', game: 'c4', col }); this.isMyTurn = false; }
       else if (this.boardMode === 'p2p' && fromRemote) this.isMyTurn = true;
       this._renderBoardArena();
-      if (this.c4.winner) { this.sound.play(this.c4.winner === 'TIE' ? 'click' : 'win'); return; }
+      if (this.c4.winner) {
+        this.sound.play(this.c4.winner === 'TIE' ? 'click' : 'win');
+        this._maybeRecordBoard('connect4', this.c4.winner, this.c4.winner === 1);
+        return;
+      }
       if (this.boardMode === 'ai' && this.c4.turn === 2) {
         setTimeout(() => {
           const ai = this.c4.getAIMove();
-          if (ai !== null) { this.c4.drop(ai); this.sound.play('move'); this._renderBoardArena(); if (this.c4.winner) this.sound.play(this.c4.winner === 'TIE' ? 'click' : 'lose'); }
+          if (ai !== null) {
+            this.c4.drop(ai); this.sound.play('move'); this._renderBoardArena();
+            if (this.c4.winner) { this.sound.play(this.c4.winner === 'TIE' ? 'click' : 'lose'); this._maybeRecordBoard('connect4', this.c4.winner, this.c4.winner === 1); }
+          }
         }, 350);
       }
     }
@@ -368,7 +431,7 @@
         this.chess.move(fromR, fromC, r, c);
         this.isMyTurn = true;
         this._renderBoardArena();
-        if (this.chess.winner) this.sound.play('win');
+        if (this.chess.winner) { this.sound.play('win'); this._maybeRecordBoard('chess', this.chess.winner, this.chess.winner === 'White'); }
         return;
       }
       if (this.chess.selected && this.chess.validMoves.some(m => m.r === r && m.c === c)) {
@@ -377,11 +440,14 @@
         this.sound.play('move');
         if (this.boardMode === 'p2p') { this.p2p.send({ scope: 'board', type: 'MOVE', game: 'chess', fromR: from.r, fromC: from.c, r, c }); this.isMyTurn = false; }
         this._renderBoardArena();
-        if (this.chess.winner) { this.sound.play('win'); return; }
+        if (this.chess.winner) { this.sound.play('win'); this._maybeRecordBoard('chess', this.chess.winner, this.chess.winner === 'White'); return; }
         if (this.boardMode === 'ai' && this.chess.turn === 'b') {
           setTimeout(() => {
             const m = this.chess.getAIMove();
-            if (m) { this.chess.move(m.from.r, m.from.c, m.to.r, m.to.c); this.sound.play('move'); this._renderBoardArena(); if (this.chess.winner) this.sound.play('lose'); }
+            if (m) {
+              this.chess.move(m.from.r, m.from.c, m.to.r, m.to.c); this.sound.play('move'); this._renderBoardArena();
+              if (this.chess.winner) { this.sound.play('lose'); this._maybeRecordBoard('chess', this.chess.winner, this.chess.winner === 'White'); }
+            }
           }, 400);
         }
       } else {
@@ -413,11 +479,11 @@
       body.innerHTML = `
         <div class="az-flex-col az-gap-3">
           <div class="az-flex-between az-card" style="background:rgba(255,204,0,0.12);">
-            <span class="az-text-headline">💰 Guthaben</span>
-            <span class="az-badge az-badge-gold" data-wallet-badge>${this.wallet.balance.toLocaleString('de-DE')} Coins</span>
+            <span class="az-flex az-gap-1 az-text-headline">${Icon('wallet', { size: 16 })}<span>Guthaben</span></span>
+            <span class="az-badge az-badge-gold" data-wallet-badge>${this.wallet.balance.toLocaleString('de-DE')}</span>
           </div>
           <div class="az-grid-3">
-            ${window.CASINO_GAMES.map(g => `<div class="az-game-tile" data-casino="${g.id}"><div class="az-tile-icon">${g.icon}</div><div class="az-tile-label">${g.title}</div></div>`).join('')}
+            ${window.CASINO_GAMES.map(g => `<div class="az-game-tile" data-casino="${g.id}">${Icon(g.icon, { size: 22 })}<div class="az-tile-label">${g.title}</div></div>`).join('')}
           </div>
           <div class="az-text-footnote" style="text-align:center;">Virtuelle Coins zum Spaß — kein Echtgeld, kein Server.</div>
         </div>`;
@@ -432,10 +498,10 @@
       body.innerHTML = `
         <div class="az-flex-col az-gap-3">
           <div class="az-flex-between">
-            <button id="az-casino-back" class="az-btn az-btn-plain">← Zurück</button>
-            <span class="az-badge az-badge-gold" data-wallet-badge>${this.wallet.balance.toLocaleString('de-DE')} Coins</span>
+            <button id="az-casino-back" class="az-btn az-btn-plain az-flex az-gap-1">${Icon('chevronLeft', { size: 15 })}<span>Zurück</span></button>
+            <span class="az-badge az-badge-gold" data-wallet-badge>${this.wallet.balance.toLocaleString('de-DE')}</span>
           </div>
-          <div class="az-text-title3" style="text-align:center;">${game.icon} ${game.title}</div>
+          <div class="az-flex az-gap-2" style="justify-content:center;align-items:center;">${Icon(game.icon, { size: 20 })}<span class="az-text-title3">${game.title}</span></div>
           <div id="az-casino-panel"></div>
         </div>`;
       body.querySelector('#az-casino-back').onclick = () => {
@@ -447,6 +513,7 @@
       const ctx = {
         wallet: this.wallet,
         playSound: (n) => this.sound.play(n),
+        recordResult: (result, delta) => this._recordResult(game.id, result, delta),
         duel: {
           isConnected: () => this.p2p.isConnected(),
           isHost: () => this.p2p.isHost,
@@ -456,6 +523,40 @@
         }
       };
       game.render(body.querySelector('#az-casino-panel'), ctx);
+    }
+
+    // ==========================================================
+    // LEADERBOARD / NETWORK TAB
+    // ==========================================================
+    _renderLeaderboard(body) {
+      if (!this.ledger) {
+        body.innerHTML = `<div class="az-text-footnote" style="text-align:center;">Lade lokales Klassenbuch…</div>`;
+        return;
+      }
+      const rows = this.network.buildLeaderboard(this.ledger.deviceId);
+      body.innerHTML = `
+        <div class="az-flex-col az-gap-3">
+          <div class="az-card az-flex-col az-gap-1">
+            <span class="az-flex az-gap-1 az-text-headline">${Icon('link', { size: 15 })}<span>Dein Netzwerk</span></span>
+            <span class="az-text-footnote">
+              ${rows.length} bekannte Geräte · ${this.ledger.chain.length} eigene Blöcke.
+              Jede Online-Verbindung tauscht euer gesamtes bekanntes Netzwerk aus — so wächst deine Rangliste mit jedem neuen Kontakt, ganz ohne Server.
+            </span>
+          </div>
+          <div class="az-flex-col az-gap-2">
+            ${rows.length === 0
+              ? `<div class="az-text-footnote" style="text-align:center;">Noch keine Ergebnisse — spiel eine Runde Arcade oder Casino.</div>`
+              : rows.map((r, i) => `
+                <div class="az-leaderboard-row ${r.isMe ? 'az-me' : ''}">
+                  <div class="az-lb-rank">${i + 1}</div>
+                  <div class="az-lb-info">
+                    <div class="az-lb-name">${r.name}${r.isMe ? ' (Du)' : ''}</div>
+                    <div class="az-lb-meta">${r.fingerprint} · ${r.blocks} Blöcke · ${r.wins}S/${r.losses}N</div>
+                  </div>
+                  <div class="az-lb-score ${r.netCoins > 0 ? 'az-positive' : r.netCoins < 0 ? 'az-negative' : ''}">${r.netCoins > 0 ? '+' : ''}${r.netCoins}</div>
+                </div>`).join('')}
+          </div>
+        </div>`;
     }
   }
 

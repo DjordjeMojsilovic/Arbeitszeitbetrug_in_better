@@ -43,9 +43,7 @@
         background: var(--az-blue); color:#fff; border:none; border-radius:24px; font-weight:700; font-size:13px;
         cursor:pointer; box-shadow:0 8px 20px rgba(0,0,0,0.3);
       }
-      .az-pill.az-hidden { display:none !important; }
-      .az-window { width: 380px; max-height: 620px; border-radius: 20px; box-shadow: 0 24px 48px rgba(0,0,0,0.35); display:flex; flex-direction:column; overflow:hidden; }
-      .az-window.az-hidden { display:none !important; }
+      .az-window { width: min(380px, calc(100vw - 32px)); max-height: min(620px, calc(100vh - 32px)); border-radius: 20px; box-shadow: 0 24px 48px rgba(0,0,0,0.35); display:flex; flex-direction:column; overflow:hidden; }
       .az-header { display:flex; align-items:center; justify-content:space-between; padding: 12px 16px; cursor:move; border-bottom:1px solid var(--az-separator); }
       .az-social-panel { margin: 8px 16px 0; }
     `;

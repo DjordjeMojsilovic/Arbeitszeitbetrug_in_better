@@ -16,14 +16,14 @@
   // ==========================================================
   class SlotMachineEngine {
     constructor() {
-      this.symbols = ['💼', '🍒', '💰', '💎', '7️⃣', '🚀'];
+      this.symbols = ['briefcase', 'cherry', 'coin', 'diamond', 'star', 'rocket'];
     }
     spin(bet) {
       const reels = [pick(this.symbols), pick(this.symbols), pick(this.symbols)];
       let payout = 0;
       let label = '';
       if (reels[0] === reels[1] && reels[1] === reels[2]) {
-        const jackpotSymbols = ['💎', '7️⃣'];
+        const jackpotSymbols = ['diamond', 'star'];
         payout = jackpotSymbols.includes(reels[0]) ? bet * 50 : bet * 20;
         label = jackpotSymbols.includes(reels[0]) ? 'JACKPOT' : 'BIG WIN';
       } else if (reels[0] === reels[1] || reels[1] === reels[2] || reels[0] === reels[2]) {

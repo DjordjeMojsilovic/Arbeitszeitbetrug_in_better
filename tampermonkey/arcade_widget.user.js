@@ -149,6 +149,200 @@
   root.CasinoWallet = CasinoWallet;
 })(typeof window !== 'undefined' ? window : globalThis);
 
+// ---- src/core/ledger.js ----
+/**
+ * Peer-to-peer result ledger — gives the app a "small blockchain network"
+ * feel without any server: every match result is appended to a local,
+ * hash-chained log (like a block header: index, timestamp, previous hash,
+ * own hash). When two peers connect over WebRTC they exchange everything
+ * they know — their own chain plus every other chain they have picked up
+ * from previous connections — and merge it in after verifying the hash
+ * chain. Meet enough people and your local "network view" keeps growing,
+ * exactly like gossip propagation in a real P2P network. There is still
+ * no mining or consensus: each device's chain is authoritative for that
+ * device's own results, the "chain" only makes tampering with your own
+ * history detectable.
+ */
+(function (root) {
+  'use strict';
+
+  const GENESIS_PREV = '0'.repeat(64);
+  const DEVICE_KEY = 'arcade_device_id_v1';
+  const LEDGER_KEY = 'arcade_ledger_v1';
+  const NETWORK_KEY = 'arcade_network_ledger_v1';
+
+  function storageGet(key) {
+    return new Promise((resolve) => {
+      if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+        chrome.storage.local.get([key], (res) => resolve(res ? res[key] : undefined));
+      } else {
+        try { const raw = localStorage.getItem(key); resolve(raw ? JSON.parse(raw) : undefined); }
+        catch (e) { resolve(undefined); }
+      }
+    });
+  }
+
+  function storageSet(key, value) {
+    return new Promise((resolve) => {
+      if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+        chrome.storage.local.set({ [key]: value }, () => resolve());
+      } else {
+        try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) {}
+        resolve();
+      }
+    });
+  }
+
+  async function sha256Hex(input) {
+    try {
+      const enc = new TextEncoder().encode(input);
+      const buf = await crypto.subtle.digest('SHA-256', enc);
+      return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+    } catch (e) {
+      // Fallback for environments without SubtleCrypto — still deterministic,
+      // just not cryptographically strong. Good enough for a fun tamper-hint.
+      let h1 = 0x811c9dc5, h2 = 0x01000193;
+      for (let i = 0; i < input.length; i++) {
+        const c = input.charCodeAt(i);
+        h1 = (h1 ^ c) * 16777619 >>> 0;
+        h2 = (h2 + c) * 2654435761 >>> 0;
+      }
+      return (h1.toString(16).padStart(8, '0') + h2.toString(16).padStart(8, '0')).repeat(4).slice(0, 64);
+    }
+  }
+
+  function randomDeviceId() {
+    const bytes = new Uint8Array(8);
+    (crypto.getRandomValues ? crypto : { getRandomValues: (a) => a.forEach((_, i) => a[i] = Math.floor(Math.random() * 256)) }).getRandomValues(bytes);
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  async function getOrCreateDeviceId() {
+    let id = await storageGet(DEVICE_KEY);
+    if (!id) { id = randomDeviceId(); await storageSet(DEVICE_KEY, id); }
+    return id;
+  }
+
+  async function blockHash(block) {
+    return sha256Hex(`${block.index}|${block.ts}|${block.game}|${block.result}|${block.delta}|${block.prevHash}`);
+  }
+
+  async function isChainValid(chain) {
+    if (!Array.isArray(chain) || chain.length === 0) return false;
+    if (chain[0].prevHash !== GENESIS_PREV || chain[0].index !== 0) return false;
+    for (let i = 0; i < chain.length; i++) {
+      const b = chain[i];
+      if (i > 0 && b.prevHash !== chain[i - 1].hash) return false;
+      const expected = await blockHash(b);
+      if (expected !== b.hash) return false;
+    }
+    return true;
+  }
+
+  class PlayerLedger {
+    constructor(deviceId, name, chain) {
+      this.deviceId = deviceId;
+      this.name = name;
+      this.chain = chain || [];
+    }
+
+    static async load(defaultName) {
+      const deviceId = await getOrCreateDeviceId();
+      const saved = await storageGet(LEDGER_KEY);
+      if (saved && saved.deviceId === deviceId) {
+        return new PlayerLedger(deviceId, saved.name || defaultName, saved.chain || []);
+      }
+      return new PlayerLedger(deviceId, defaultName, []);
+    }
+
+    async persist() {
+      await storageSet(LEDGER_KEY, { deviceId: this.deviceId, name: this.name, chain: this.chain });
+    }
+
+    setName(name) { this.name = name; }
+
+    async addResult(game, result, delta) {
+      const prev = this.chain[this.chain.length - 1];
+      const block = {
+        index: this.chain.length,
+        ts: Date.now(),
+        game,
+        result, // 'win' | 'lose' | 'tie' | 'push'
+        delta: delta || 0,
+        prevHash: prev ? prev.hash : GENESIS_PREV
+      };
+      block.hash = await blockHash(block);
+      this.chain.push(block);
+      await this.persist();
+      return block;
+    }
+  }
+
+  class NetworkLedger {
+    constructor() {
+      this.peers = {}; // deviceId -> { name, chain }
+    }
+
+    async load() {
+      const saved = await storageGet(NETWORK_KEY);
+      this.peers = saved || {};
+    }
+
+    async persist() {
+      await storageSet(NETWORK_KEY, this.peers);
+    }
+
+    setLocal(deviceId, name, chain) {
+      this.peers[deviceId] = { name, chain };
+    }
+
+    exportPayload() {
+      return this.peers;
+    }
+
+    /** Merge a peer's known chains in, keeping the longest valid chain per device. */
+    async mergeAll(payload) {
+      let learned = 0, updated = 0;
+      if (!payload || typeof payload !== 'object') return { learned, updated };
+      for (const deviceId of Object.keys(payload)) {
+        const incoming = payload[deviceId];
+        if (!incoming || !Array.isArray(incoming.chain) || !incoming.chain.length) continue;
+        const existing = this.peers[deviceId];
+        if (existing && existing.chain.length >= incoming.chain.length) continue;
+        if (!(await isChainValid(incoming.chain))) continue;
+        this.peers[deviceId] = { name: incoming.name || 'Unbekannt', chain: incoming.chain };
+        if (existing) updated++; else learned++;
+      }
+      if (learned || updated) await this.persist();
+      return { learned, updated };
+    }
+
+    buildLeaderboard(myDeviceId) {
+      const rows = Object.keys(this.peers).map((deviceId) => {
+        const { name, chain } = this.peers[deviceId];
+        let netCoins = 0, wins = 0, losses = 0;
+        for (const b of chain) {
+          netCoins += b.delta || 0;
+          if (b.result === 'win') wins++;
+          else if (b.result === 'lose') losses++;
+        }
+        const lastHash = chain.length ? chain[chain.length - 1].hash : '';
+        return {
+          deviceId, name: name || 'Unbekannt', isMe: deviceId === myDeviceId,
+          blocks: chain.length, netCoins, wins, losses,
+          fingerprint: lastHash.slice(0, 8) || deviceId.slice(0, 8)
+        };
+      });
+      rows.sort((a, b) => b.netCoins - a.netCoins || b.wins - a.wins);
+      return rows;
+    }
+  }
+
+  root.PlayerLedger = PlayerLedger;
+  root.NetworkLedger = NetworkLedger;
+  root.LedgerCrypto = { sha256Hex, isChainValid };
+})(typeof window !== 'undefined' ? window : globalThis);
+
 // ---- src/core/board-games.js ----
 /**
  * Board game engines: Tic-Tac-Toe, Connect 4, Chess.
@@ -410,14 +604,14 @@
   // ==========================================================
   class SlotMachineEngine {
     constructor() {
-      this.symbols = ['💼', '🍒', '💰', '💎', '7️⃣', '🚀'];
+      this.symbols = ['briefcase', 'cherry', 'coin', 'diamond', 'star', 'rocket'];
     }
     spin(bet) {
       const reels = [pick(this.symbols), pick(this.symbols), pick(this.symbols)];
       let payout = 0;
       let label = '';
       if (reels[0] === reels[1] && reels[1] === reels[2]) {
-        const jackpotSymbols = ['💎', '7️⃣'];
+        const jackpotSymbols = ['diamond', 'star'];
         payout = jackpotSymbols.includes(reels[0]) ? bet * 50 : bet * 20;
         label = jackpotSymbols.includes(reels[0]) ? 'JACKPOT' : 'BIG WIN';
       } else if (reels[0] === reels[1] || reels[1] === reels[2] || reels[0] === reels[2]) {
@@ -1025,6 +1219,7 @@
   }
 
   .az-root, .az-root * { box-sizing: border-box; }
+  .az-root .az-hidden { display: none !important; }
 
   .az-text-large-title { font-size: 28px; font-weight: 700; letter-spacing: -0.3px; }
   .az-text-title2 { font-size: 20px; font-weight: 700; }
@@ -1167,6 +1362,54 @@
   .az-gap-2 { gap: var(--az-space-2); }
   .az-gap-3 { gap: var(--az-space-3); }
 
+  /* Icon buttons & generic controls */
+  .az-icon-btn { display:flex; align-items:center; justify-content:center; }
+  .az-btn .az-icon-inline { margin-right: 2px; }
+
+  /* Responsive board grids — scale with container width instead of fixed px */
+  .az-board-wrap { width: 100%; display: flex; justify-content: center; }
+  .az-board-wrap > * { width: 100%; display: flex; justify-content: center; }
+  .az-ttt-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; width: 100%; max-width: 260px; aspect-ratio: 1; }
+  .az-ttt-cell {
+    background: var(--az-fill); border-radius: var(--az-radius-sm);
+    display: flex; align-items: center; justify-content: center;
+    font-size: clamp(20px, 8vw, 30px); font-weight: 800; cursor: pointer;
+    aspect-ratio: 1;
+  }
+  .az-ttt-cell.az-win { background: rgba(52,199,89,0.25); }
+
+  .az-c4-wrap { display: flex; flex-direction: column; align-items: center; gap: 4px; width: 100%; max-width: 320px; }
+  .az-c4-drops { display: grid; grid-template-columns: repeat(7, 1fr); gap: 3px; width: 100%; }
+  .az-c4-drop-btn { min-height: 28px; background: transparent; border: none; color: var(--az-secondary-label); cursor: pointer; display:flex; align-items:center; justify-content:center; border-radius: 6px; }
+  .az-c4-drop-btn:hover { background: var(--az-fill); color: var(--az-label); }
+  .az-c4-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; width: 100%; background: var(--az-grouped-bg); padding: 6px; border-radius: var(--az-radius-sm); }
+  .az-c4-cell { aspect-ratio: 1; border-radius: 50%; background: var(--az-bg); border: 1px solid var(--az-separator); }
+  .az-c4-cell.az-p1 { background: var(--az-blue); }
+  .az-c4-cell.az-p2 { background: var(--az-red); }
+
+  .az-chess-grid { display: grid; grid-template-columns: repeat(8, 1fr); width: 100%; max-width: 320px; aspect-ratio: 1; border-radius: 8px; overflow: hidden; border: 1px solid var(--az-separator); }
+  .az-chess-cell { display: flex; align-items: center; justify-content: center; font-size: clamp(14px, 4.4vw, 22px); cursor: pointer; aspect-ratio: 1; }
+  .az-chess-cell.az-light { background: #e5e5ea; }
+  .az-chess-cell.az-dark { background: #48484a; }
+  .az-chess-cell.az-selected { background: var(--az-blue) !important; }
+  .az-chess-cell.az-valid { background: rgba(52,199,89,0.45) !important; }
+  .az-chess-piece-w { color: #0a84ff; }
+  .az-chess-piece-b { color: #ff453a; }
+
+  /* Leaderboard */
+  .az-leaderboard-row {
+    display: flex; align-items: center; gap: var(--az-space-2);
+    padding: var(--az-space-2); border-radius: var(--az-radius-sm); background: var(--az-fill);
+  }
+  .az-leaderboard-row.az-me { border: 1.5px solid var(--az-blue); }
+  .az-lb-rank { width: 22px; text-align: center; font-weight: 800; color: var(--az-secondary-label); flex-shrink: 0; }
+  .az-lb-info { flex: 1; min-width: 0; }
+  .az-lb-name { font-weight: 700; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .az-lb-meta { font-size: 11px; color: var(--az-secondary-label); font-family: 'SF Mono', ui-monospace, monospace; }
+  .az-lb-score { font-weight: 800; font-size: 15px; flex-shrink: 0; }
+  .az-lb-score.az-positive { color: var(--az-green); }
+  .az-lb-score.az-negative { color: var(--az-red); }
+
   /* Casino-specific components */
   .az-playing-card {
     width: 42px; height: 60px;
@@ -1249,29 +1492,102 @@
   `;
 })(typeof window !== 'undefined' ? window : globalThis);
 
+// ---- src/ui/icons.js ----
+/**
+ * Inline SVG icon set — replaces all emoji in the UI with line icons that
+ * match the SF Symbols weight/aesthetic described in design.md (stroke
+ * icons, consistent weight, no second display face). 24x24 viewBox,
+ * currentColor stroke so icons inherit text color and adapt to the theme.
+ */
+(function (root) {
+  'use strict';
+
+  const W = 'fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"';
+
+  const PATHS = {
+    controller: `<rect x="2.5" y="8" width="19" height="10" rx="5" ${W}/><line x1="7" y1="11.2" x2="7" y2="14.8" ${W}/><line x1="5.2" y1="13" x2="8.8" y2="13" ${W}/><circle cx="15.5" cy="11.7" r="1" fill="currentColor" stroke="none"/><circle cx="18" cy="14.2" r="1" fill="currentColor" stroke="none"/>`,
+    globe: `<circle cx="12" cy="12" r="9" ${W}/><ellipse cx="12" cy="12" rx="4" ry="9" ${W}/><line x1="3" y1="12" x2="21" y2="12" ${W}/>`,
+    speaker: `<path d="M4 9v6h4l5 4V5L8 9H4z" ${W}/><path d="M17 9.5a4 4 0 0 1 0 5" ${W}/>`,
+    speakerMute: `<path d="M4 9v6h4l5 4V5L8 9H4z" ${W}/><line x1="16" y1="10" x2="21" y2="15" ${W}/><line x1="21" y1="10" x2="16" y2="15" ${W}/>`,
+    minus: `<line x1="5" y1="12" x2="19" y2="12" ${W}/>`,
+    close: `<line x1="6" y1="6" x2="18" y2="18" ${W}/><line x1="18" y1="6" x2="6" y2="18" ${W}/>`,
+    chevronLeft: `<polyline points="15 5 8 12 15 19" ${W}/>`,
+    grid: `<rect x="3" y="3" width="18" height="18" rx="2" ${W}/><line x1="9" y1="3" x2="9" y2="21" ${W}/><line x1="15" y1="3" x2="15" y2="21" ${W}/><line x1="3" y1="9" x2="21" y2="9" ${W}/><line x1="3" y1="15" x2="21" y2="15" ${W}/>`,
+    discs: `<circle cx="8" cy="9" r="3.4" ${W}/><circle cx="16" cy="9" r="3.4" ${W}/><circle cx="12" cy="16" r="3.4" ${W}/>`,
+    crown: `<path d="M4 18h16l-1.4-8-3.6 3-3-5.5-3 5.5-3.6-3L4 18z" ${W}/>`,
+    bot: `<rect x="5" y="9" width="14" height="10" rx="3" ${W}/><line x1="12" y1="5.5" x2="12" y2="9" ${W}/><circle cx="12" cy="4" r="1.2" fill="currentColor" stroke="none"/><circle cx="9.2" cy="14" r="1.1" fill="currentColor" stroke="none"/><circle cx="14.8" cy="14" r="1.1" fill="currentColor" stroke="none"/>`,
+    users: `<circle cx="9" cy="8" r="3" ${W}/><path d="M3.5 19c0-3.3 2.5-5.5 5.5-5.5S14.5 15.7 14.5 19" ${W}/><circle cx="17" cy="9" r="2.4" ${W}/><path d="M15.8 13.2c2.4.4 3.8 2.2 3.8 5" ${W}/>`,
+    refresh: `<path d="M4 12a8 8 0 0 1 13.7-5.7L20 8" ${W}/><polyline points="20 3 20 8 15 8" ${W}/><path d="M20 12a8 8 0 0 1-13.7 5.7L4 16" ${W}/><polyline points="4 21 4 16 9 16" ${W}/>`,
+    dice: `<rect x="3.5" y="3.5" width="17" height="17" rx="4" ${W}/><circle cx="8.3" cy="8.3" r="1.1" fill="currentColor" stroke="none"/><circle cx="15.7" cy="8.3" r="1.1" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="8.3" cy="15.7" r="1.1" fill="currentColor" stroke="none"/><circle cx="15.7" cy="15.7" r="1.1" fill="currentColor" stroke="none"/>`,
+    cards: `<rect x="3" y="6" width="12" height="15" rx="2" ${W}/><path d="M8.5 6 15 3.3a1 1 0 0 1 1.3.6l4 9.6a1 1 0 0 1-.6 1.3L17 16" ${W}/>`,
+    target: `<circle cx="12" cy="12" r="8.5" ${W}/><circle cx="12" cy="12" r="4.5" ${W}/><circle cx="12" cy="12" r="0.9" fill="currentColor" stroke="none"/>`,
+    coin: `<circle cx="12" cy="12" r="8.5" ${W}/><path d="M9.3 15.2c0 1 1.1 1.8 2.7 1.8s2.7-.8 2.7-1.8-1.1-1.4-2.7-1.7-2.7-.7-2.7-1.7 1.1-1.8 2.7-1.8 2.7.8 2.7 1.8" ${W}/>`,
+    slot: `<rect x="4" y="5" width="16" height="14" rx="3" ${W}/><line x1="9.3" y1="7" x2="9.3" y2="17" ${W}/><line x1="14.7" y1="7" x2="14.7" y2="17" ${W}/>`,
+    wheel: `<circle cx="12" cy="12" r="8.5" ${W}/><line x1="12" y1="3.5" x2="12" y2="20.5" ${W}/><line x1="3.5" y1="12" x2="20.5" y2="12" ${W}/><line x1="6" y1="6" x2="18" y2="18" ${W}/><line x1="18" y1="6" x2="6" y2="18" ${W}/>`,
+    drop: `<circle cx="6" cy="5" r="1.6" fill="currentColor" stroke="none"/><path d="M12 3v6" ${W}/><path d="M6 12h12" ${W}/><path d="M4 15.5h16l-1.6 4a2 2 0 0 1-1.9 1.5H7.5a2 2 0 0 1-1.9-1.5L4 15.5z" ${W}/>`,
+    trophy: `<path d="M7 4h10v5a5 5 0 0 1-10 0V4z" ${W}/><path d="M7 5H4a3 3 0 0 0 3 4" ${W}/><path d="M17 5h3a3 3 0 0 1-3 4" ${W}/><line x1="12" y1="14" x2="12" y2="18" ${W}/><line x1="8.5" y1="20.5" x2="15.5" y2="20.5" ${W}/><line x1="12" y1="18" x2="12" y2="20.5" ${W}/>`,
+    link: `<path d="M9.5 14.5 14.5 9.5" ${W}/><path d="M11 7l1.5-1.5a3.5 3.5 0 0 1 5 5L16 12" ${W}/><path d="M13 17l-1.5 1.5a3.5 3.5 0 0 1-5-5L8 12" ${W}/>`,
+    check: `<polyline points="5 13 10 18 19 7" ${W}/>`,
+    copy: `<rect x="9" y="9" width="11" height="11" rx="2" ${W}/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1" ${W}/>`,
+    person: `<circle cx="12" cy="8" r="3.4" ${W}/><path d="M4.8 19.5c0-3.7 2.9-6 7.2-6s7.2 2.3 7.2 6" ${W}/>`,
+    plus: `<line x1="12" y1="5" x2="12" y2="19" ${W}/><line x1="5" y1="12" x2="19" y2="12" ${W}/>`,
+    wallet: `<rect x="3" y="6" width="18" height="13" rx="2.5" ${W}/><path d="M3 9.5h18" ${W}/><circle cx="16.5" cy="14" r="1.1" fill="currentColor" stroke="none"/>`,
+    briefcase: `<rect x="3" y="8" width="18" height="12" rx="2" ${W}/><path d="M9 8V6a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2" ${W}/><line x1="3" y1="13" x2="21" y2="13" ${W}/>`,
+    cherry: `<circle cx="8.5" cy="17" r="3" ${W}/><circle cx="15" cy="18" r="3" ${W}/><path d="M8.5 14 11 5" ${W}/><path d="M15 15 11 5" ${W}/>`,
+    diamond: `<path d="M4 10 9 4h6l5 6-10 11z" ${W}/><path d="M4 10h16" ${W}/>`,
+    star: `<path d="M12 3.5 14.5 9l6 .8-4.4 4 1.2 5.9-5.3-3-5.3 3 1.2-5.9-4.4-4 6-.8z" ${W}/>`,
+    rocket: `<path d="M12 3c2.8 1.6 4.5 4.6 4.5 8.5 0 2-.5 3.7-1.4 5.2l-3.1 2.8-3.1-2.8C7.9 15.2 7.4 13.5 7.4 11.5 7.4 7.6 9.2 4.6 12 3z" ${W}/><circle cx="12" cy="10.5" r="1.5" ${W}/><path d="M8.5 16.5 6 20l3.7-1.3" ${W}/><path d="M15.5 16.5 18 20l-3.7-1.3" ${W}/>`
+  };
+
+  function icon(name, opts = {}) {
+    const size = opts.size || 18;
+    const cls = opts.class ? ` class="${opts.class}"` : '';
+    const body = PATHS[name] || '';
+    return `<svg${cls} width="${size}" height="${size}" viewBox="0 0 24 24" aria-hidden="true" style="display:block;flex-shrink:0;">${body}</svg>`;
+  }
+
+  root.AZIcon = icon;
+})(typeof window !== 'undefined' ? window : globalThis);
+
 // ---- src/ui/casino-panels.js ----
 /**
  * Casino tab: registry of per-game panels. Each panel renders itself into a
  * container element using the shared engines from core/casino-games.js and
  * settles bets through the shared CasinoWallet. Games marked `duel: true`
  * additionally support a peer-to-peer "vs. friend" mode over the same
- * WebRTC connection used by the Arcade tab (see startQuickDuel below).
+ * WebRTC connection used by the Arcade tab. Every settled round is also
+ * written to the local result ledger via ctx.recordResult so it shows up
+ * on the Rangliste (leaderboard) tab.
  */
 (function (root) {
   'use strict';
 
+  const Icon = (name, opts) => window.AZIcon(name, opts);
+
   function fmt(n) { return n.toLocaleString('de-DE'); }
 
+  /** Records a settled round to the ledger: positive/negative/zero net change. */
+  function settle(ctx, bet, payout) {
+    const delta = payout - bet;
+    if (delta > 0) ctx.recordResult('win', delta);
+    else if (delta < 0) ctx.recordResult('lose', delta);
+    else ctx.recordResult('tie', 0);
+  }
+
   function cardHtml(card, opts = {}) {
-    if (!card || opts.faceDown) return `<div class="az-playing-card az-face-down">🂠</div>`;
+    if (!card || opts.faceDown) return `<div class="az-playing-card az-face-down"></div>`;
     return `<div class="az-playing-card ${card.red ? 'az-red' : ''} ${opts.held ? 'az-held' : ''}">
       <div>${card.rank}</div><div>${card.suit}</div>
     </div>`;
   }
 
+  const PIP_LAYOUTS = {
+    1: [4], 2: [0, 8], 3: [0, 4, 8], 4: [0, 2, 6, 8], 5: [0, 2, 4, 6, 8], 6: [0, 2, 3, 5, 6, 8]
+  };
   function dieHtml(v) {
-    const pips = ['', '⚀', '⚁', '⚂', '⚃', '⚄', '⚅'];
-    return `<div class="az-die">${pips[v] || v}</div>`;
+    const active = new Set(PIP_LAYOUTS[v] || []);
+    const dots = Array.from({ length: 9 }, (_, i) => `<span style="width:5px;height:5px;border-radius:50%;background:${active.has(i) ? 'currentColor' : 'transparent'};"></span>`).join('');
+    return `<div class="az-die"><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:3px;width:24px;height:24px;">${dots}</div></div>`;
   }
 
   function betControl(id, defaultValue = 10) {
@@ -1297,23 +1613,20 @@
 
   function duelToggleHtml(connected) {
     return `<div class="az-segmented" style="margin-bottom:8px;">
-      <button data-duel-mode="house" class="az-active">🏠 Gegen Haus</button>
-      <button data-duel-mode="friend" ${connected ? '' : 'disabled title="Erst im Arcade-Tab verbinden"'}>🌐 Gegen Freund</button>
+      <button data-duel-mode="house" class="az-active az-flex az-gap-1"><span>Gegen Haus</span></button>
+      <button data-duel-mode="friend" class="az-flex az-gap-1" ${connected ? '' : 'disabled title="Erst im Arcade-Tab verbinden"'}>${Icon('globe', { size: 14 })}<span>Gegen Freund</span></button>
     </div>`;
   }
 
   function wireDuelToggle(container, ctx, onModeChange) {
-    let mode = 'house';
     const btns = container.querySelectorAll('[data-duel-mode]');
     btns.forEach(btn => {
       btn.addEventListener('click', () => {
         if (btn.disabled) return;
-        mode = btn.getAttribute('data-duel-mode');
         btns.forEach(b => b.classList.toggle('az-active', b === btn));
-        onModeChange(mode);
+        onModeChange(btn.getAttribute('data-duel-mode'));
       });
     });
-    return () => mode;
   }
 
   // ==========================================================
@@ -1324,13 +1637,13 @@
     container.innerHTML = `
       <div class="az-flex-col az-gap-3" style="align-items:center;">
         <div class="az-slot-reels">
-          <div class="az-slot-reel" id="r0">💼</div>
-          <div class="az-slot-reel" id="r1">💰</div>
-          <div class="az-slot-reel" id="r2">7️⃣</div>
+          <div class="az-slot-reel" id="r0">${Icon(engine.symbols[0], { size: 26 })}</div>
+          <div class="az-slot-reel" id="r1">${Icon(engine.symbols[1], { size: 26 })}</div>
+          <div class="az-slot-reel" id="r2">${Icon(engine.symbols[2], { size: 26 })}</div>
         </div>
         ${betControl('slot-bet', 10)}
-        <button id="slot-spin" class="az-btn az-btn-block">🎰 Spin</button>
-        <div class="az-result-banner" id="slot-banner">Viel Glück!</div>
+        <button id="slot-spin" class="az-btn az-btn-block">Drehen</button>
+        <div class="az-result-banner" id="slot-banner">Viel Glück.</div>
       </div>`;
     const banner = container.querySelector('#slot-banner');
     const spinBtn = container.querySelector('#slot-spin');
@@ -1338,25 +1651,26 @@
 
     spinBtn.onclick = () => {
       const bet = readBet(container, 'slot-bet', ctx.wallet);
-      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
       spinBtn.disabled = true;
       reels.forEach(r => r.classList.add('az-spinning'));
       ctx.playSound('spin');
       const result = engine.spin(bet);
       let ticks = 0;
       const iv = setInterval(() => {
-        reels.forEach(r => r.textContent = engine.symbols[Math.floor(Math.random() * engine.symbols.length)]);
+        reels.forEach(r => r.innerHTML = Icon(engine.symbols[Math.floor(Math.random() * engine.symbols.length)], { size: 26 }));
         ticks++;
         if (ticks > 8) {
           clearInterval(iv);
-          reels.forEach((r, i) => { r.classList.remove('az-spinning'); r.textContent = result.reels[i]; });
+          reels.forEach((r, i) => { r.classList.remove('az-spinning'); r.innerHTML = Icon(result.reels[i], { size: 26 }); });
           spinBtn.disabled = false;
+          settle(ctx, bet, result.payout);
           if (result.win) {
             ctx.wallet.award(result.payout);
-            setBanner(banner, `${result.label}! +${fmt(result.payout)} 💰`, 'win');
+            setBanner(banner, `${result.label} — plus ${fmt(result.payout)}`, 'win');
             ctx.playSound('win');
           } else {
-            setBanner(banner, 'Kein Treffer, nochmal versuchen!', 'lose');
+            setBanner(banner, 'Kein Treffer, nochmal versuchen.', 'lose');
           }
         }
       }, 80);
@@ -1393,7 +1707,7 @@
     function showPlayControls() {
       controls.innerHTML = `<button id="bj-hit" class="az-btn">Hit</button><button id="bj-stand" class="az-btn az-btn-secondary">Stand</button>`;
       container.querySelector('#bj-hit').onclick = () => {
-        const r = engine.hit();
+        engine.hit();
         renderHands(true);
         if (engine.phase === 'done') finish();
       };
@@ -1412,18 +1726,21 @@
       renderHands(false);
       const r = engine.result;
       const labels = {
-        blackjack: 'Blackjack! 🎉', win: 'Gewonnen!', dealer_bust: 'Dealer überkauft — gewonnen!',
-        lose: 'Verloren.', dealer_blackjack: 'Dealer hat Blackjack.', bust: 'Überkauft!', push: 'Unentschieden.'
+        blackjack: 'Blackjack.', win: 'Gewonnen.', dealer_bust: 'Dealer überkauft — gewonnen.',
+        lose: 'Verloren.', dealer_blackjack: 'Dealer hat Blackjack.', bust: 'Überkauft.', push: 'Unentschieden.'
       };
+      settle(ctx, engine.bet, r.payout);
       if (r.payout > 0) ctx.wallet.award(r.payout);
-      setBanner(banner, `${labels[r.outcome] || ''} (${r.payout > 0 ? '+' + fmt(r.payout) : '±0'})`, r.payout > engine.bet ? 'win' : (r.payout === engine.bet ? '' : 'lose'));
+      const net = r.payout - engine.bet;
+      const netLabel = net > 0 ? `+${fmt(net)}` : net < 0 ? `${fmt(net)}` : '±0';
+      setBanner(banner, `${labels[r.outcome] || ''} (${netLabel})`, net > 0 ? 'win' : (net === 0 ? '' : 'lose'));
       ctx.playSound(r.payout > engine.bet ? 'win' : 'lose');
       showDealControls();
     }
 
     function deal() {
       const bet = readBet(container, 'bj-bet', ctx.wallet);
-      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
       engine.deal(bet);
       renderHands(true);
       if (engine.phase === 'done') { finish(); return; }
@@ -1454,7 +1771,7 @@
           <button class="az-choice-btn" data-type="dozen" data-value="2">2. Dutzend</button>
           <button class="az-choice-btn" data-type="dozen" data-value="3">3. Dutzend</button>
         </div>
-        <button id="rl-spin" class="az-btn az-btn-block">🎡 Drehen</button>
+        <button id="rl-spin" class="az-btn az-btn-block">Drehen</button>
         <div class="az-result-banner" id="rl-banner">Wähle deine Wette.</div>
       </div>`;
     let selected = { type: 'color', value: 'red' };
@@ -1469,19 +1786,20 @@
     const resultEl = container.querySelector('#rl-result');
     container.querySelector('#rl-spin').onclick = () => {
       const bet = readBet(container, 'rl-bet', ctx.wallet);
-      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
       ctx.playSound('spin');
       const result = engine.spin(selected.type, selected.value, bet);
-      resultEl.textContent = '...';
+      resultEl.textContent = '···';
       setTimeout(() => {
         resultEl.textContent = result.number;
         resultEl.className = 'az-roulette-number az-num-' + result.color;
+        settle(ctx, bet, result.payout);
         if (result.win) {
           ctx.wallet.award(result.payout);
-          setBanner(banner, `${result.number} (${result.color}) — Gewonnen! +${fmt(result.payout)}`, 'win');
+          setBanner(banner, `${result.number} (${result.color}) — gewonnen, plus ${fmt(result.payout)}`, 'win');
           ctx.playSound('win');
         } else {
-          setBanner(banner, `${result.number} (${result.color}) — Verloren.`, 'lose');
+          setBanner(banner, `${result.number} (${result.color}) — verloren.`, 'lose');
         }
       }, 700);
     };
@@ -1496,7 +1814,7 @@
     container.innerHTML = `
       <div class="az-flex-col az-gap-3" style="align-items:center;">
         <div class="az-hand-row" id="vp-hand"></div>
-        <div class="az-text-footnote">Bube-oder-besser gewinnt · Karten antippen zum Halten</div>
+        <div class="az-text-footnote">Bube oder besser gewinnt — Karten antippen zum Halten.</div>
         ${betControl('vp-bet', 10)}
         <button id="vp-action" class="az-btn az-btn-block">Deal</button>
         <div class="az-result-banner" id="vp-banner">Setze deinen Einsatz und drücke Deal.</div>
@@ -1520,7 +1838,7 @@
     actionBtn.onclick = () => {
       if (engine.phase === 'idle' || engine.phase === 'done') {
         const bet = readBet(container, 'vp-bet', ctx.wallet);
-        if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+        if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
         held = [];
         const hand = engine.deal(bet);
         renderHand(hand);
@@ -1529,9 +1847,10 @@
       } else {
         const r = engine.draw(held);
         renderHand(r.hand);
+        settle(ctx, engine.bet, r.payout);
         if (r.win) {
           ctx.wallet.award(r.payout);
-          setBanner(banner, `${r.rank.label}! +${fmt(r.payout)} 💰`, 'win');
+          setBanner(banner, `${r.rank.label} — plus ${fmt(r.payout)}`, 'win');
           ctx.playSound('win');
         } else {
           setBanner(banner, `${r.rank.label} — kein Gewinn.`, 'lose');
@@ -1576,15 +1895,16 @@
     const banner = container.querySelector('#bc-banner');
     container.querySelector('#bc-deal').onclick = () => {
       const bet = readBet(container, 'bc-bet', ctx.wallet);
-      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
       const r = engine.play(betOn, bet);
       container.querySelector('#bc-banker').innerHTML = r.banker.map(c => cardHtml(c)).join('');
       container.querySelector('#bc-player').innerHTML = r.player.map(c => cardHtml(c)).join('');
       const won = r.payout > bet;
       const push = r.payout === bet;
+      settle(ctx, bet, r.payout);
       if (r.payout > 0) ctx.wallet.award(r.payout);
       const winnerLabel = { player: 'Spieler', banker: 'Banker', tie: 'Unentschieden' }[r.winner];
-      setBanner(banner, `${winnerLabel} gewinnt (${r.playerTotal} vs ${r.bankerTotal}) ${won ? '+' + fmt(r.payout) : push ? '± 0' : 'verloren'}`, won ? 'win' : (push ? '' : 'lose'));
+      setBanner(banner, `${winnerLabel} gewinnt (${r.playerTotal} vs ${r.bankerTotal})${won ? ', plus ' + fmt(r.payout) : push ? ', unentschieden' : ', verloren'}`, won ? 'win' : (push ? '' : 'lose'));
       ctx.playSound(won ? 'win' : 'lose');
     };
   }
@@ -1597,9 +1917,9 @@
     container.innerHTML = `
       <div class="az-flex-col az-gap-3" style="align-items:center;">
         ${duelToggleHtml(ctx.duel.isConnected())}
-        <div class="az-flex az-gap-2" id="cr-dice"><div class="az-die">?</div><div class="az-die">?</div></div>
+        <div class="az-flex az-gap-2" id="cr-dice"><div class="az-die"></div><div class="az-die"></div></div>
         ${betControl('cr-bet', 15)}
-        <button id="cr-roll" class="az-btn az-btn-block">🎲 Werfen</button>
+        <button id="cr-roll" class="az-btn az-btn-block">Werfen</button>
         <div class="az-result-banner" id="cr-banner">Come-out Roll: 7/11 gewinnt sofort, 2/3/12 verliert sofort.</div>
       </div>`;
     const banner = container.querySelector('#cr-banner');
@@ -1610,7 +1930,7 @@
 
     wireDuelToggle(container, ctx, (mode) => {
       duelMode = mode;
-      rollBtn.textContent = mode === 'friend' ? '🌐 Duell starten' : '🎲 Werfen';
+      rollBtn.textContent = mode === 'friend' ? 'Duell starten' : 'Werfen';
       setBanner(banner, mode === 'friend' ? 'Beide setzen den gleichen Einsatz — höhere Augensumme gewinnt.' : 'Come-out Roll: 7/11 gewinnt sofort, 2/3/12 verliert sofort.', '');
     });
 
@@ -1618,7 +1938,7 @@
       if (data.type !== 'craps_start' && data.type !== 'craps_response') return;
       if (data.type === 'craps_start') {
         if (duelPending) return;
-        if (!ctx.wallet.place(data.stake)) { setBanner(banner, 'Nicht genug Coins für das Duell!', 'lose'); return; }
+        if (!ctx.wallet.place(data.stake)) { setBanner(banner, 'Nicht genug Coins für das Duell.', 'lose'); return; }
         const mine = root.CrapsEngine.duelRoll();
         diceEl.innerHTML = mine.dice.map(dieHtml).join('');
         ctx.duel.send('craps_response', { mySum: mine.sum, stake: data.stake });
@@ -1630,19 +1950,20 @@
     });
 
     function resolveDuel(hostSum, guestSum, stake) {
-      if (hostSum === guestSum) { ctx.wallet.award(stake); setBanner(banner, `Unentschieden (${hostSum}) — Einsatz zurück.`, ''); return; }
+      if (hostSum === guestSum) { ctx.wallet.award(stake); ctx.recordResult('tie', 0); setBanner(banner, `Unentschieden (${hostSum}) — Einsatz zurück.`, ''); return; }
       const iAmHost = ctx.duel.isHost();
       const hostWins = hostSum > guestSum;
       const iWin = (iAmHost && hostWins) || (!iAmHost && !hostWins);
-      if (iWin) { ctx.wallet.award(stake * 2); setBanner(banner, `Du gewinnst! (${iAmHost ? hostSum : guestSum} vs ${iAmHost ? guestSum : hostSum})`, 'win'); ctx.playSound('win'); }
-      else { setBanner(banner, `Verloren. (${iAmHost ? hostSum : guestSum} vs ${iAmHost ? guestSum : hostSum})`, 'lose'); ctx.playSound('lose'); }
+      settle(ctx, stake, iWin ? stake * 2 : 0);
+      if (iWin) { ctx.wallet.award(stake * 2); setBanner(banner, `Du gewinnst (${iAmHost ? hostSum : guestSum} gegen ${iAmHost ? guestSum : hostSum}).`, 'win'); ctx.playSound('win'); }
+      else { setBanner(banner, `Verloren (${iAmHost ? hostSum : guestSum} gegen ${iAmHost ? guestSum : hostSum}).`, 'lose'); ctx.playSound('lose'); }
     }
 
     rollBtn.onclick = () => {
       const bet = readBet(container, 'cr-bet', ctx.wallet);
       if (duelMode === 'friend') {
         if (!ctx.duel.isConnected()) { setBanner(banner, 'Nicht verbunden.', 'lose'); return; }
-        if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+        if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
         const mine = root.CrapsEngine.duelRoll();
         diceEl.innerHTML = mine.dice.map(dieHtml).join('');
         duelPending = { hostSum: mine.sum, stake: bet };
@@ -1651,21 +1972,20 @@
         return;
       }
       if (engine.point === null) {
-        if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+        if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
         engine.reset();
-        const r = engine.start(bet);
-        handleRoll(r);
+        handleRoll(engine.start(bet));
       } else {
-        const r = engine.roll();
-        handleRoll(r);
+        handleRoll(engine.roll());
       }
     };
 
     function handleRoll(r) {
       diceEl.innerHTML = r.dice.map(dieHtml).join('');
       if (r.done) {
-        if (r.outcome === 'win') { ctx.wallet.award(r.payout); setBanner(banner, `${r.sum} — Gewonnen! +${fmt(r.payout)}`, 'win'); ctx.playSound('win'); }
-        else { setBanner(banner, `${r.sum} — Verloren.`, 'lose'); ctx.playSound('lose'); }
+        settle(ctx, engine.bet, r.payout);
+        if (r.outcome === 'win') { ctx.wallet.award(r.payout); setBanner(banner, `${r.sum} — gewonnen, plus ${fmt(r.payout)}`, 'win'); ctx.playSound('win'); }
+        else { setBanner(banner, `${r.sum} — verloren.`, 'lose'); ctx.playSound('lose'); }
         engine.reset();
       } else {
         setBanner(banner, `Punkt: ${r.point}. Wirf erneut — 7 verliert, ${r.point} gewinnt.`, '');
@@ -1680,14 +2000,14 @@
     const engine = new root.SicBoEngine();
     container.innerHTML = `
       <div class="az-flex-col az-gap-3" style="align-items:center;">
-        <div class="az-flex az-gap-2" id="sb-dice"><div class="az-die">?</div><div class="az-die">?</div><div class="az-die">?</div></div>
+        <div class="az-flex az-gap-2" id="sb-dice"><div class="az-die"></div><div class="az-die"></div><div class="az-die"></div></div>
         ${betControl('sb-bet', 15)}
         <div class="az-choice-row">
           <button class="az-choice-btn az-active" data-bet="big">Groß (11–17)</button>
           <button class="az-choice-btn" data-bet="small">Klein (4–10)</button>
           <button class="az-choice-btn" data-bet="any_triple">Jeder Pasch (×30)</button>
         </div>
-        <button id="sb-roll" class="az-btn az-btn-block">🎲 Würfeln</button>
+        <button id="sb-roll" class="az-btn az-btn-block">Würfeln</button>
         <div class="az-result-banner" id="sb-banner">Groß/Klein gewinnt 2:1, außer bei Pasch.</div>
       </div>`;
     let betType = 'big';
@@ -1702,11 +2022,12 @@
     const diceEl = container.querySelector('#sb-dice');
     container.querySelector('#sb-roll').onclick = () => {
       const bet = readBet(container, 'sb-bet', ctx.wallet);
-      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
       const r = engine.roll(betType, null, bet);
       diceEl.innerHTML = r.dice.map(dieHtml).join('');
-      if (r.win) { ctx.wallet.award(r.payout); setBanner(banner, `Summe ${r.sum} — Gewonnen! +${fmt(r.payout)}`, 'win'); ctx.playSound('win'); }
-      else { setBanner(banner, `Summe ${r.sum}${r.isTriple ? ' (Pasch)' : ''} — Verloren.`, 'lose'); ctx.playSound('lose'); }
+      settle(ctx, bet, r.payout);
+      if (r.win) { ctx.wallet.award(r.payout); setBanner(banner, `Summe ${r.sum} — gewonnen, plus ${fmt(r.payout)}`, 'win'); ctx.playSound('win'); }
+      else { setBanner(banner, `Summe ${r.sum}${r.isTriple ? ' (Pasch)' : ''} — verloren.`, 'lose'); ctx.playSound('lose'); }
     };
   }
 
@@ -1731,7 +2052,7 @@
     const streakEl = container.querySelector('#hl-streak');
     const actions = container.querySelector('#hl-actions');
     let duelMode = 'house';
-    let duelStake = 0;
+    let pendingHost = null;
 
     wireDuelToggle(container, ctx, (mode) => {
       duelMode = mode;
@@ -1741,7 +2062,7 @@
 
     ctx.duel.setHandler((data) => {
       if (data.type === 'hilo_start') {
-        if (!ctx.wallet.place(data.stake)) { setBanner(banner, 'Nicht genug Coins für das Duell!', 'lose'); return; }
+        if (!ctx.wallet.place(data.stake)) { setBanner(banner, 'Nicht genug Coins für das Duell.', 'lose'); return; }
         const deck = root.CardDeck.createShoe(1);
         const myCard = deck.pop();
         cardEl.innerHTML = cardHtml(myCard);
@@ -1751,25 +2072,25 @@
         resolveDuel(pendingHost.val, data.myVal, pendingHost.stake, pendingHost.card, data.myCard);
       }
     });
-    let pendingHost = null;
 
     function resolveDuel(hostVal, guestVal, stake, hostCard, guestCard) {
       cardEl.innerHTML = cardHtml(hostCard) + cardHtml(guestCard);
-      if (hostVal === guestVal) { ctx.wallet.award(stake); setBanner(banner, 'Unentschieden — Einsatz zurück.', ''); return; }
+      if (hostVal === guestVal) { ctx.wallet.award(stake); ctx.recordResult('tie', 0); setBanner(banner, 'Unentschieden — Einsatz zurück.', ''); return; }
       const iAmHost = ctx.duel.isHost();
       const hostWins = hostVal > guestVal;
       const iWin = (iAmHost && hostWins) || (!iAmHost && !hostWins);
-      if (iWin) { ctx.wallet.award(stake * 2); setBanner(banner, 'Du gewinnst das Duell!', 'win'); ctx.playSound('win'); }
+      settle(ctx, stake, iWin ? stake * 2 : 0);
+      if (iWin) { ctx.wallet.award(stake * 2); setBanner(banner, 'Du gewinnst das Duell.', 'win'); ctx.playSound('win'); }
       else { setBanner(banner, 'Verloren.', 'lose'); ctx.playSound('lose'); }
     }
 
     function resetActions() {
       if (duelMode === 'friend') {
-        actions.innerHTML = `<button id="hl-duel-start" class="az-btn az-btn-block">🌐 Duell starten</button>`;
+        actions.innerHTML = `<button id="hl-duel-start" class="az-btn az-btn-block">Duell starten</button>`;
         container.querySelector('#hl-duel-start').onclick = () => {
           if (!ctx.duel.isConnected()) { setBanner(banner, 'Nicht verbunden.', 'lose'); return; }
           const bet = readBet(container, 'hl-bet', ctx.wallet);
-          if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+          if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
           const deck = root.CardDeck.createShoe(1);
           const myCard = deck.pop();
           cardEl.innerHTML = cardHtml(myCard);
@@ -1785,12 +2106,12 @@
 
     function startSolo() {
       const bet = readBet(container, 'hl-bet', ctx.wallet);
-      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
       const r = engine.start(bet);
       cardEl.innerHTML = cardHtml(r.card);
       streakEl.textContent = 'Streak: 0';
       setBanner(banner, 'Höher oder niedriger?', '');
-      actions.innerHTML = `<button id="hl-lower" class="az-btn az-btn-secondary">⬇️ Niedriger</button><button id="hl-cash" class="az-btn az-btn-success">💰 Auszahlen</button><button id="hl-higher" class="az-btn">⬆️ Höher</button>`;
+      actions.innerHTML = `<button id="hl-lower" class="az-btn az-btn-secondary">Niedriger</button><button id="hl-cash" class="az-btn az-btn-success">Auszahlen</button><button id="hl-higher" class="az-btn">Höher</button>`;
       container.querySelector('#hl-higher').onclick = () => guess('higher');
       container.querySelector('#hl-lower').onclick = () => guess('lower');
       container.querySelector('#hl-cash').onclick = cashOut;
@@ -1801,8 +2122,9 @@
       cardEl.innerHTML = cardHtml(r.card);
       if (r.correct) {
         streakEl.textContent = `Streak: ${r.streak} · möglicher Gewinn ${fmt(r.currentPayout)}`;
-        setBanner(banner, 'Richtig! Weiter ziehen oder auszahlen.', 'win');
+        setBanner(banner, 'Richtig — weiter ziehen oder auszahlen.', 'win');
       } else {
+        settle(ctx, engine.bet, 0);
         setBanner(banner, 'Falsch geraten — Einsatz verloren.', 'lose');
         ctx.playSound('lose');
         resetActions();
@@ -1811,7 +2133,12 @@
 
     function cashOut() {
       const r = engine.cashOut();
-      if (r) { ctx.wallet.award(r.payout); setBanner(banner, `Ausgezahlt: +${fmt(r.payout)} bei Streak ${r.streak}`, 'win'); ctx.playSound('win'); }
+      if (r) {
+        settle(ctx, engine.bet, r.payout);
+        ctx.wallet.award(r.payout);
+        setBanner(banner, `Ausgezahlt: plus ${fmt(r.payout)} bei Streak ${r.streak}`, 'win');
+        ctx.playSound('win');
+      }
       resetActions();
     }
 
@@ -1826,7 +2153,7 @@
     container.innerHTML = `
       <div class="az-flex-col az-gap-3" style="align-items:center;">
         ${duelToggleHtml(ctx.duel.isConnected())}
-        <div class="az-coin" id="cf-coin">🪙</div>
+        <div class="az-coin" id="cf-coin">${Icon('coin', { size: 26 })}</div>
         <div class="az-text-footnote" id="cf-hint">Wähle Kopf oder Zahl.</div>
         ${betControl('cf-bet', 10)}
         <div class="az-choice-row" id="cf-choices">
@@ -1854,48 +2181,50 @@
     wireDuelToggle(container, ctx, (mode) => {
       duelMode = mode;
       choices.style.display = mode === 'friend' ? 'none' : 'flex';
-      flipBtn.textContent = mode === 'friend' ? '🌐 Duell starten (du = Kopf)' : 'Werfen';
+      flipBtn.textContent = mode === 'friend' ? 'Duell starten (du bist Kopf)' : 'Werfen';
       hint.textContent = mode === 'friend' ? 'Host ist immer Kopf, Freund ist Zahl.' : 'Wähle Kopf oder Zahl.';
     });
 
     ctx.duel.setHandler((data) => {
       if (data.type !== 'coinflip_start') return;
-      if (!ctx.wallet.place(data.stake)) { setBanner(banner, 'Nicht genug Coins für das Duell!', 'lose'); return; }
-      animateCoin(data.result, () => {
+      if (!ctx.wallet.place(data.stake)) { setBanner(banner, 'Nicht genug Coins für das Duell.', 'lose'); return; }
+      animateCoin(() => {
         const iWin = data.result === 'tails'; // guest is always "tails"
-        if (iWin) { ctx.wallet.award(data.stake * 2); setBanner(banner, `${data.result === 'heads' ? 'Kopf' : 'Zahl'}! Du gewinnst!`, 'win'); ctx.playSound('win'); }
-        else { setBanner(banner, `${data.result === 'heads' ? 'Kopf' : 'Zahl'}! Verloren.`, 'lose'); ctx.playSound('lose'); }
+        settle(ctx, data.stake, iWin ? data.stake * 2 : 0);
+        const side = data.result === 'heads' ? 'Kopf' : 'Zahl';
+        if (iWin) { ctx.wallet.award(data.stake * 2); setBanner(banner, `${side} — du gewinnst.`, 'win'); ctx.playSound('win'); }
+        else { setBanner(banner, `${side} — verloren.`, 'lose'); ctx.playSound('lose'); }
       });
     });
 
-    function animateCoin(result, done) {
+    function animateCoin(done) {
       coinEl.classList.add('az-flipping');
-      setTimeout(() => {
-        coinEl.classList.remove('az-flipping');
-        coinEl.textContent = result === 'heads' ? '👑' : '🔢';
-        done();
-      }, 600);
+      setTimeout(() => { coinEl.classList.remove('az-flipping'); done(); }, 600);
     }
 
     flipBtn.onclick = () => {
       const bet = readBet(container, 'cf-bet', ctx.wallet);
       if (duelMode === 'friend') {
         if (!ctx.duel.isConnected()) { setBanner(banner, 'Nicht verbunden.', 'lose'); return; }
-        if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+        if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
         const result = root.CoinFlipEngine.duelFlip();
         ctx.duel.send('coinflip_start', { stake: bet, result });
-        animateCoin(result, () => {
+        animateCoin(() => {
           const iWin = result === 'heads'; // host is always "heads"
-          if (iWin) { ctx.wallet.award(bet * 2); setBanner(banner, `${result === 'heads' ? 'Kopf' : 'Zahl'}! Du gewinnst!`, 'win'); ctx.playSound('win'); }
-          else { setBanner(banner, `${result === 'heads' ? 'Kopf' : 'Zahl'}! Verloren.`, 'lose'); ctx.playSound('lose'); }
+          settle(ctx, bet, iWin ? bet * 2 : 0);
+          const side = result === 'heads' ? 'Kopf' : 'Zahl';
+          if (iWin) { ctx.wallet.award(bet * 2); setBanner(banner, `${side} — du gewinnst.`, 'win'); ctx.playSound('win'); }
+          else { setBanner(banner, `${side} — verloren.`, 'lose'); ctx.playSound('lose'); }
         });
         return;
       }
-      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
       const r = engine.flip(call, bet);
-      animateCoin(r.result, () => {
-        if (r.win) { ctx.wallet.award(r.payout); setBanner(banner, `${r.result === 'heads' ? 'Kopf' : 'Zahl'}! Gewonnen! +${fmt(r.payout)}`, 'win'); ctx.playSound('win'); }
-        else { setBanner(banner, `${r.result === 'heads' ? 'Kopf' : 'Zahl'}! Verloren.`, 'lose'); ctx.playSound('lose'); }
+      animateCoin(() => {
+        settle(ctx, bet, r.payout);
+        const side = r.result === 'heads' ? 'Kopf' : 'Zahl';
+        if (r.win) { ctx.wallet.award(r.payout); setBanner(banner, `${side} — gewonnen, plus ${fmt(r.payout)}`, 'win'); ctx.playSound('win'); }
+        else { setBanner(banner, `${side} — verloren.`, 'lose'); ctx.playSound('lose'); }
       });
     };
   }
@@ -1914,7 +2243,7 @@
         </div>
         <div class="az-flex az-gap-1" id="pl-buckets"></div>
         ${betControl('pl-bet', 10)}
-        <button id="pl-drop" class="az-btn az-btn-block">⬇️ Ball fallen lassen</button>
+        <button id="pl-drop" class="az-btn az-btn-block">Ball fallen lassen</button>
         <div class="az-result-banner" id="pl-banner">Wähle dein Risiko.</div>
       </div>`;
     let risk = 'low';
@@ -1937,14 +2266,15 @@
 
     container.querySelector('#pl-drop').onclick = () => {
       const bet = readBet(container, 'pl-bet', ctx.wallet);
-      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
       const r = engine.drop(bet, risk);
       ctx.playSound('spin');
       setTimeout(() => {
         renderBuckets(r.bucket);
-        if (r.payout > bet) { ctx.wallet.award(r.payout); setBanner(banner, `${r.multiplier}× Feld — Gewonnen! +${fmt(r.payout)}`, 'win'); ctx.playSound('win'); }
+        settle(ctx, bet, r.payout);
+        if (r.payout > bet) { ctx.wallet.award(r.payout); setBanner(banner, `${r.multiplier}× Feld — gewonnen, plus ${fmt(r.payout)}`, 'win'); ctx.playSound('win'); }
         else if (r.payout === bet) { ctx.wallet.award(r.payout); setBanner(banner, `${r.multiplier}× Feld — Einsatz zurück.`, ''); }
-        else { setBanner(banner, `${r.multiplier}× Feld — Verloren.`, 'lose'); ctx.playSound('lose'); }
+        else { setBanner(banner, `${r.multiplier}× Feld — verloren.`, 'lose'); ctx.playSound('lose'); }
       }, 500);
     };
   }
@@ -1958,8 +2288,8 @@
       <div class="az-flex-col az-gap-3" style="align-items:center;">
         <div class="az-wheel-track" id="wh-track"></div>
         ${betControl('wh-bet', 15)}
-        <button id="wh-spin" class="az-btn az-btn-block">🎡 Glücksrad drehen</button>
-        <div class="az-result-banner" id="wh-banner">Triff dein Glück!</div>
+        <button id="wh-spin" class="az-btn az-btn-block">Glücksrad drehen</button>
+        <div class="az-result-banner" id="wh-banner">Triff dein Glück.</div>
       </div>`;
     const track = container.querySelector('#wh-track');
     const banner = container.querySelector('#wh-banner');
@@ -1969,7 +2299,7 @@
     renderTrack();
     container.querySelector('#wh-spin').onclick = () => {
       const bet = readBet(container, 'wh-bet', ctx.wallet);
-      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins!', 'lose'); return; }
+      if (!ctx.wallet.place(bet)) { setBanner(banner, 'Nicht genug Coins.', 'lose'); return; }
       ctx.playSound('spin');
       let ticks = 0;
       const iv = setInterval(() => {
@@ -1979,26 +2309,27 @@
           clearInterval(iv);
           const r = engine.spin(bet);
           renderTrack(r.index);
-          if (r.payout > bet) { ctx.wallet.award(r.payout); setBanner(banner, `${r.multiplier}× — Gewonnen! +${fmt(r.payout)}`, 'win'); ctx.playSound('win'); }
+          settle(ctx, bet, r.payout);
+          if (r.payout > bet) { ctx.wallet.award(r.payout); setBanner(banner, `${r.multiplier}× — gewonnen, plus ${fmt(r.payout)}`, 'win'); ctx.playSound('win'); }
           else if (r.payout === bet) { ctx.wallet.award(r.payout); setBanner(banner, `${r.multiplier}× — Einsatz zurück.`, ''); }
-          else { setBanner(banner, `${r.multiplier}× — Verloren.`, 'lose'); ctx.playSound('lose'); }
+          else { setBanner(banner, `${r.multiplier}× — verloren.`, 'lose'); ctx.playSound('lose'); }
         }
       }, 90);
     };
   }
 
   root.CASINO_GAMES = [
-    { id: 'slot', icon: '🎰', title: 'Spielautomat', render: renderSlot },
-    { id: 'blackjack', icon: '🃏', title: 'Blackjack', render: renderBlackjack },
-    { id: 'roulette', icon: '🎡', title: 'Roulette', render: renderRoulette },
-    { id: 'videopoker', icon: '🂡', title: 'Video Poker', render: renderVideoPoker },
-    { id: 'baccarat', icon: '🎴', title: 'Baccarat', render: renderBaccarat },
-    { id: 'craps', icon: '🎲', title: 'Craps', duel: true, render: renderCraps },
-    { id: 'sicbo', icon: '🀄', title: 'Sic Bo', render: renderSicBo },
-    { id: 'higherlower', icon: '🔀', title: 'Höher/Tiefer', duel: true, render: renderHigherLower },
-    { id: 'coinflip', icon: '🪙', title: 'Münzwurf', duel: true, render: renderCoinFlip },
-    { id: 'plinko', icon: '⚪', title: 'Plinko', render: renderPlinko },
-    { id: 'wheel', icon: '🎯', title: 'Glücksrad', render: renderWheel }
+    { id: 'slot', icon: 'slot', title: 'Spielautomat', render: renderSlot },
+    { id: 'blackjack', icon: 'cards', title: 'Blackjack', render: renderBlackjack },
+    { id: 'roulette', icon: 'target', title: 'Roulette', render: renderRoulette },
+    { id: 'videopoker', icon: 'cards', title: 'Video Poker', render: renderVideoPoker },
+    { id: 'baccarat', icon: 'cards', title: 'Baccarat', render: renderBaccarat },
+    { id: 'craps', icon: 'dice', title: 'Craps', duel: true, render: renderCraps },
+    { id: 'sicbo', icon: 'dice', title: 'Sic Bo', render: renderSicBo },
+    { id: 'higherlower', icon: 'cards', title: 'Höher/Tiefer', duel: true, render: renderHigherLower },
+    { id: 'coinflip', icon: 'coin', title: 'Münzwurf', duel: true, render: renderCoinFlip },
+    { id: 'plinko', icon: 'drop', title: 'Plinko', render: renderPlinko },
+    { id: 'wheel', icon: 'wheel', title: 'Glücksrad', render: renderWheel }
   ];
 })(typeof window !== 'undefined' ? window : globalThis);
 
@@ -2007,13 +2338,14 @@
  * ArcadeApp — the shared application shell.
  * Renders into either a floating Shadow DOM widget (browser extension /
  * Tampermonkey userscript) or a full page (standalone web app / PWA).
- * Owns the board-game tab, the Casino tab, the shared P2P connection and
- * the shared casino wallet.
+ * Owns the board-game tab, the Casino tab, the leaderboard/network tab,
+ * the shared P2P connection and the shared casino wallet.
  */
 (function (root) {
   'use strict';
 
   const STATE_KEY = 'arcade_app_state_v5';
+  const Icon = (name, opts) => window.AZIcon(name, opts);
 
   class SoundEngine {
     constructor() { this.muted = true; }
@@ -2057,7 +2389,11 @@
       this.p2p = new window.P2PNetworkManager();
       this.username = `Spieler${Math.floor(100 + Math.random() * 900)}`;
 
-      this.activeTab = 'arcade'; // 'arcade' | 'casino'
+      this.ledger = null; // PlayerLedger, loaded asynchronously
+      this._pendingResults = []; // queued until the ledger finishes loading
+      this.network = new window.NetworkLedger();
+
+      this.activeTab = 'arcade'; // 'arcade' | 'casino' | 'leaderboard'
       this.activeBoardGame = 'tictactoe';
       this.boardMode = 'ai'; // 'ai' | 'local' | 'p2p'
       this.activeCasinoGame = null;
@@ -2068,21 +2404,21 @@
       this.ttt = new window.TicTacToeEngine();
       this.c4 = new window.Connect4Engine();
       this.chess = new window.ChessEngine();
-      this.scores = { tictactoe: [0, 0], connect4: [0, 0] };
 
       this._bindP2P();
       this.wallet.onChange((bal) => {
         this.root.querySelectorAll('[data-wallet-badge]').forEach(el => {
-          el.textContent = `${bal.toLocaleString('de-DE')} Coins`;
+          el.textContent = `${bal.toLocaleString('de-DE')}`;
         });
       });
     }
 
     _bindP2P() {
       this.p2p.callbacks.onConnected = () => {
-        this.updateSocialStatus('✅ Verbunden!');
+        this.updateSocialStatus('Verbunden.');
         this.boardMode = 'p2p';
         this.resetActiveBoardGame();
+        this._sendLedgerSync();
         this.render();
       };
       this.p2p.callbacks.onDisconnected = () => {
@@ -2090,13 +2426,38 @@
         this.boardMode = 'ai';
         this.render();
       };
-      this.p2p.callbacks.onError = (msg) => this.updateSocialStatus('❌ ' + msg);
+      this.p2p.callbacks.onError = (msg) => this.updateSocialStatus(msg);
       this.p2p.callbacks.onData = (data) => {
         if (!data || !data.type) return;
-        if (data.type === 'HANDSHAKE') { this.updateSocialStatus(`✅ ${data.name || 'Verbunden'}`); return; }
+        if (data.type === 'HANDSHAKE') { this.updateSocialStatus(`Verbunden mit ${data.name || 'Mitspieler'}`); return; }
         if (data.scope === 'board') { this._handleBoardData(data); return; }
         if (data.scope === 'casino' && this.casinoDuelHandler) { this.casinoDuelHandler(data); return; }
+        if (data.scope === 'ledger' && data.type === 'SYNC') { this._receiveLedgerSync(data.payload); return; }
       };
+    }
+
+    async _sendLedgerSync() {
+      if (!this.ledger) return;
+      this.network.setLocal(this.ledger.deviceId, this.username, this.ledger.chain);
+      this.p2p.send({ scope: 'ledger', type: 'SYNC', payload: this.network.exportPayload() });
+    }
+
+    async _receiveLedgerSync(payload) {
+      const { learned, updated } = await this.network.mergeAll(payload);
+      if (learned || updated) {
+        // Gossip forward: reply with our (now larger) network view so both
+        // sides converge even if the peer only knew a subset.
+        this.p2p.send({ scope: 'ledger', type: 'SYNC', payload: this.network.exportPayload() });
+        if (this.activeTab === 'leaderboard') this._renderBody();
+      }
+    }
+
+    async _recordResult(game, result, delta) {
+      if (!this.ledger) { this._pendingResults.push([game, result, delta]); return; }
+      await this.ledger.addResult(game, result, delta || 0);
+      this.network.setLocal(this.ledger.deviceId, this.username, this.ledger.chain);
+      if (this.p2p.isConnected()) this._sendLedgerSync();
+      if (this.activeTab === 'leaderboard') this._renderBody();
     }
 
     updateSocialStatus(text) {
@@ -2104,34 +2465,41 @@
       if (el) el.textContent = text;
     }
 
-    mount() {
+    async mount() {
       this.render();
+      this.ledger = await window.PlayerLedger.load(this.username);
+      await this.network.load();
+      const queued = this._pendingResults.splice(0);
+      for (const [game, result, delta] of queued) await this.ledger.addResult(game, result, delta || 0);
+      this.network.setLocal(this.ledger.deviceId, this.username, this.ledger.chain);
+      if (this.p2p.isConnected()) this._sendLedgerSync();
+      if (this.activeTab === 'leaderboard') this._renderBody();
     }
 
     render() {
       const isFloating = this.mode === 'floating';
       this.root.innerHTML = `
         <div class="az-root ${isFloating ? 'az-floating-root' : 'az-fullpage-root'}">
-          ${isFloating ? `<button id="az-pill" class="az-pill ${this.isCollapsed ? '' : 'az-hidden'}">🎮 Arcade</button>` : ''}
+          ${isFloating ? `<button id="az-pill" class="az-pill ${this.isCollapsed ? '' : 'az-hidden'}">${Icon('controller', { size: 18 })}<span>Arcade</span></button>` : ''}
           <div id="az-window" class="az-window az-glass ${this.isCollapsed ? 'az-hidden' : ''}">
             <div id="az-header" class="az-header">
-              <div class="az-text-title3">🎮 Arbeitszeitbetrug Arcade</div>
+              <div class="az-flex az-gap-2 az-text-title3">${Icon('controller', { size: 20 })}<span>Arbeitszeitbetrug</span></div>
               <div class="az-flex az-gap-1">
-                <button id="az-btn-social" class="az-btn az-btn-icon" title="Online spielen">🌐</button>
-                <button id="az-btn-sound" class="az-btn az-btn-icon" title="Ton">${this.sound.muted ? '🔇' : '🔊'}</button>
-                ${isFloating ? '<button id="az-btn-min" class="az-btn az-btn-icon" title="Minimieren">—</button>' : ''}
+                <button id="az-btn-social" class="az-btn az-btn-icon" title="Online spielen">${Icon('globe')}</button>
+                <button id="az-btn-sound" class="az-btn az-btn-icon" title="Ton">${Icon(this.sound.muted ? 'speakerMute' : 'speaker')}</button>
+                ${isFloating ? `<button id="az-btn-min" class="az-btn az-btn-icon" title="Minimieren">${Icon('minus')}</button>` : ''}
               </div>
             </div>
 
             <div id="az-social" class="az-card az-social-panel ${this.socialOpen ? '' : 'az-hidden'}">
               <div class="az-flex-between">
-                <span class="az-text-headline">🌐 Online P2P (kein Server nötig)</span>
-                <span id="az-social-status" class="az-text-footnote">${this.p2p.isConnected() ? '✅ Verbunden' : 'Offline'}</span>
+                <span class="az-flex az-gap-1 az-text-headline">${Icon('globe', { size: 15 })}<span>Online P2P — kein Server nötig</span></span>
+                <span id="az-social-status" class="az-text-footnote">${this.p2p.isConnected() ? 'Verbunden' : 'Offline'}</span>
               </div>
               <div class="az-flex az-gap-2" style="margin-top:8px;">
                 <input id="az-username" class="az-input" style="flex:1;" maxlength="14" value="${this.username}" placeholder="Dein Name">
               </div>
-              <div class="az-flex az-gap-2" style="margin-top:8px;">
+              <div class="az-flex az-gap-2" style="margin-top:8px;flex-wrap:wrap;">
                 <button id="az-btn-host" class="az-btn az-btn-secondary az-btn-sm">PIN erstellen</button>
                 <input id="az-pin-input" class="az-input" style="width:80px;" maxlength="4" placeholder="PIN">
                 <button id="az-btn-join" class="az-btn az-btn-sm">Beitreten</button>
@@ -2141,8 +2509,9 @@
             </div>
 
             <div class="az-segmented" style="margin: var(--az-space-2) var(--az-space-3) 0;">
-              <button data-tab="arcade" class="${this.activeTab === 'arcade' ? 'az-active' : ''}">🎮 Arcade</button>
-              <button data-tab="casino" class="${this.activeTab === 'casino' ? 'az-active' : ''}">🎰 Casino</button>
+              <button data-tab="arcade" class="az-flex az-gap-1 ${this.activeTab === 'arcade' ? 'az-active' : ''}">${Icon('controller', { size: 15 })}<span>Arcade</span></button>
+              <button data-tab="casino" class="az-flex az-gap-1 ${this.activeTab === 'casino' ? 'az-active' : ''}">${Icon('coin', { size: 15 })}<span>Casino</span></button>
+              <button data-tab="leaderboard" class="az-flex az-gap-1 ${this.activeTab === 'leaderboard' ? 'az-active' : ''}">${Icon('trophy', { size: 15 })}<span>Rangliste</span></button>
             </div>
 
             <div id="az-body" class="az-scroll" style="flex:1; padding: var(--az-space-3);"></div>
@@ -2163,7 +2532,7 @@
 
       r.querySelector('#az-btn-sound').onclick = () => {
         this.sound.muted = !this.sound.muted;
-        r.querySelector('#az-btn-sound').textContent = this.sound.muted ? '🔇' : '🔊';
+        r.querySelector('#az-btn-sound').innerHTML = Icon(this.sound.muted ? 'speakerMute' : 'speaker');
       };
 
       r.querySelector('#az-btn-social').onclick = () => { this.socialOpen = !this.socialOpen; this.render(); };
@@ -2173,7 +2542,7 @@
       });
 
       if (this.socialOpen) {
-        r.querySelector('#az-username').oninput = (e) => { this.username = e.target.value; };
+        r.querySelector('#az-username').oninput = (e) => { this.username = e.target.value; if (this.ledger) this.ledger.setName(this.username); };
         r.querySelector('#az-btn-host').onclick = () => {
           const code = this.p2p.hostRoom(this.username);
           r.querySelector('#az-pin-display').textContent = `PIN: ${code} — an Freund weitergeben`;
@@ -2191,10 +2560,9 @@
 
     _makeDraggable() {
       if (this.mode !== 'floating') return;
-      const win = this.root.querySelector('#az-window');
       const header = this.root.querySelector('#az-header');
       const hostEl = this.hostElement;
-      if (!win || !header || !hostEl) return;
+      if (!header || !hostEl) return;
       let dragging = false, sx = 0, sy = 0, il = 0, it = 0;
       header.onmousedown = (e) => {
         if (e.target.closest('button')) return;
@@ -2223,36 +2591,38 @@
       }
     }
 
+    _renderBody() {
+      const body = this.root.querySelector('#az-body');
+      if (!body) return;
+      if (this.activeTab === 'arcade') this._renderArcade(body);
+      else if (this.activeTab === 'casino') this._renderCasino(body);
+      else this._renderLeaderboard(body);
+    }
+
     // ==========================================================
     // ARCADE TAB (Board games)
     // ==========================================================
-    _renderBody() {
-      const body = this.root.querySelector('#az-body');
-      if (this.activeTab === 'arcade') this._renderArcade(body);
-      else this._renderCasino(body);
-    }
-
     _renderArcade(body) {
       const games = [
-        { id: 'tictactoe', icon: '❌⭕', label: 'Tic-Tac-Toe' },
-        { id: 'connect4', icon: '🔴🟡', label: '4 Gewinnt' },
-        { id: 'chess', icon: '♟️', label: 'Schach' }
+        { id: 'tictactoe', icon: 'grid', label: 'Tic-Tac-Toe' },
+        { id: 'connect4', icon: 'discs', label: '4 Gewinnt' },
+        { id: 'chess', icon: 'crown', label: 'Schach' }
       ];
       body.innerHTML = `
         <div class="az-flex-col az-gap-3">
           <div class="az-segmented">
-            ${games.map(g => `<button data-game="${g.id}" class="${this.activeBoardGame === g.id ? 'az-active' : ''}">${g.icon} ${g.label}</button>`).join('')}
+            ${games.map(g => `<button data-game="${g.id}" class="az-flex az-gap-1 ${this.activeBoardGame === g.id ? 'az-active' : ''}">${Icon(g.icon, { size: 15 })}<span>${g.label}</span></button>`).join('')}
           </div>
-          <div class="az-flex-between">
-            <div class="az-segmented" style="max-width:220px;">
-              <button data-mode="ai" class="${this.boardMode === 'ai' ? 'az-active' : ''}">🤖 KI</button>
-              <button data-mode="local" class="${this.boardMode === 'local' ? 'az-active' : ''}">👥 Lokal</button>
-              <button data-mode="p2p" class="${this.boardMode === 'p2p' ? 'az-active' : ''}" ${this.p2p.isConnected() ? '' : 'disabled'}>🌐 Online</button>
+          <div class="az-flex-between" style="flex-wrap:wrap;gap:8px;">
+            <div class="az-segmented" style="max-width:240px;">
+              <button data-mode="ai" class="az-flex az-gap-1 ${this.boardMode === 'ai' ? 'az-active' : ''}">${Icon('bot', { size: 14 })}<span>KI</span></button>
+              <button data-mode="local" class="az-flex az-gap-1 ${this.boardMode === 'local' ? 'az-active' : ''}">${Icon('users', { size: 14 })}<span>Lokal</span></button>
+              <button data-mode="p2p" class="az-flex az-gap-1 ${this.boardMode === 'p2p' ? 'az-active' : ''}" ${this.p2p.isConnected() ? '' : 'disabled'}>${Icon('globe', { size: 14 })}<span>Online</span></button>
             </div>
-            <button id="az-board-reset" class="az-btn az-btn-secondary az-btn-sm">🔄 Neu</button>
+            <button id="az-board-reset" class="az-btn az-btn-secondary az-btn-sm az-flex az-gap-1">${Icon('refresh', { size: 14 })}<span>Neu</span></button>
           </div>
           <div id="az-board-status" class="az-result-banner"></div>
-          <div id="az-board-arena" class="az-flex" style="justify-content:center;"></div>
+          <div class="az-board-wrap"><div id="az-board-arena"></div></div>
         </div>`;
 
       body.querySelectorAll('[data-game]').forEach(btn => btn.onclick = () => {
@@ -2288,30 +2658,31 @@
       if (!arena) return;
 
       if (this.activeBoardGame === 'tictactoe') {
-        arena.innerHTML = `<div style="display:grid;grid-template-columns:repeat(3,56px);gap:6px;">
-          ${this.ttt.board.map((v, i) => `<div data-i="${i}" class="az-card" style="width:56px;height:56px;display:flex;align-items:center;justify-content:center;font-size:26px;font-weight:800;cursor:pointer;${this.ttt.winningLine && this.ttt.winningLine.includes(i) ? 'background:rgba(52,199,89,0.25);' : ''}color:${v === 'X' ? 'var(--az-blue)' : 'var(--az-red)'}">${v}</div>`).join('')}
+        arena.innerHTML = `<div class="az-ttt-grid">
+          ${this.ttt.board.map((v, i) => {
+            const isWin = this.ttt.winningLine && this.ttt.winningLine.includes(i);
+            const color = v === 'X' ? 'var(--az-blue)' : 'var(--az-red)';
+            return `<div data-i="${i}" class="az-ttt-cell ${isWin ? 'az-win' : ''}" style="color:${color}">${v}</div>`;
+          }).join('')}
         </div>`;
         arena.querySelectorAll('[data-i]').forEach(cell => cell.onclick = () => this._playTTT(parseInt(cell.getAttribute('data-i'), 10)));
         status.textContent = this._boardStatusText('ttt');
       } else if (this.activeBoardGame === 'connect4') {
-        arena.innerHTML = `<div class="az-flex-col az-gap-1" style="align-items:center;">
-          <div style="display:grid;grid-template-columns:repeat(7,32px);gap:3px;">
-            ${Array(7).fill(0).map((_, c) => `<button data-c="${c}" class="az-btn az-btn-plain" style="min-height:24px;padding:0;">▼</button>`).join('')}
-          </div>
-          <div style="display:grid;grid-template-columns:repeat(7,32px);gap:3px;background:var(--az-grouped-bg);padding:6px;border-radius:10px;">
-            ${this.c4.board.flat().map((v, i) => `<div class="az-card" style="width:32px;height:32px;border-radius:50%;padding:0;background:${v === 1 ? '#06b6d4' : v === 2 ? '#f43f5e' : 'var(--az-bg)'}"></div>`).join('')}
-          </div>
+        arena.innerHTML = `<div class="az-c4-wrap">
+          <div class="az-c4-drops">${Array(7).fill(0).map((_, c) => `<button data-c="${c}" class="az-c4-drop-btn">▾</button>`).join('')}</div>
+          <div class="az-c4-grid">${this.c4.board.flat().map((v) => `<div class="az-c4-cell ${v === 1 ? 'az-p1' : v === 2 ? 'az-p2' : ''}"></div>`).join('')}</div>
         </div>`;
         arena.querySelectorAll('[data-c]').forEach(btn => btn.onclick = () => this._playC4(parseInt(btn.getAttribute('data-c'), 10)));
         status.textContent = this._boardStatusText('c4');
       } else {
-        arena.innerHTML = `<div style="display:grid;grid-template-columns:repeat(8,32px);">
+        arena.innerHTML = `<div class="az-chess-grid">
           ${this.chess.board.flat().map((p, i) => {
             const r = Math.floor(i / 8), c = i % 8;
             const light = (r + c) % 2 === 0;
             const isSel = this.chess.selected && this.chess.selected.r === r && this.chess.selected.c === c;
             const isValid = this.chess.validMoves.some(m => m.r === r && m.c === c);
-            return `<div data-r="${r}" data-c="${c}" style="width:32px;height:32px;display:flex;align-items:center;justify-content:center;font-size:20px;cursor:pointer;background:${isSel ? 'var(--az-blue)' : isValid ? 'rgba(52,199,89,0.4)' : light ? '#e5e5ea' : '#3a3a3c'};color:${this.chess.isWhite(p) ? '#0a84ff' : '#ff453a'}">${p}</div>`;
+            const cls = ['az-chess-cell', light ? 'az-light' : 'az-dark', isSel ? 'az-selected' : '', isValid ? 'az-valid' : '', this.chess.isWhite(p) ? 'az-chess-piece-w' : this.chess.isBlack(p) ? 'az-chess-piece-b' : ''].join(' ');
+            return `<div data-r="${r}" data-c="${c}" class="${cls}">${p}</div>`;
           }).join('')}
         </div>`;
         arena.querySelectorAll('[data-r]').forEach(cell => cell.onclick = () => this._playChess(parseInt(cell.getAttribute('data-r'), 10), parseInt(cell.getAttribute('data-c'), 10)));
@@ -2321,15 +2692,24 @@
 
     _boardStatusText(game) {
       if (game === 'ttt') {
-        if (this.ttt.winner) return this.ttt.winner === 'TIE' ? 'Unentschieden!' : `${this.ttt.winner} gewinnt! 🎉`;
+        if (this.ttt.winner) return this.ttt.winner === 'TIE' ? 'Unentschieden.' : `${this.ttt.winner} gewinnt.`;
         return this.boardMode === 'p2p' ? (this.isMyTurn ? 'Du bist dran' : 'Gegner ist dran') : `${this.ttt.turn} ist dran`;
       }
       if (game === 'c4') {
-        if (this.c4.winner) return this.c4.winner === 'TIE' ? 'Unentschieden!' : `Spieler ${this.c4.winner} gewinnt! 🎉`;
+        if (this.c4.winner) return this.c4.winner === 'TIE' ? 'Unentschieden.' : `Spieler ${this.c4.winner} gewinnt.`;
         return this.boardMode === 'p2p' ? (this.isMyTurn ? 'Du bist dran' : 'Gegner ist dran') : `Spieler ${this.c4.turn} ist dran`;
       }
-      if (this.chess.winner) return `${this.chess.winner} gewinnt! ♚🎉`;
+      if (this.chess.winner) return `${this.chess.winner} gewinnt.`;
       return this.boardMode === 'p2p' ? (this.isMyTurn ? 'Du bist dran' : 'Gegner ist dran') : (this.chess.turn === 'w' ? 'Weiß ist dran' : 'Schwarz ist dran');
+    }
+
+    /** Only AI and Online modes have a well-defined "me" to score; local pass-and-play is shared. */
+    _maybeRecordBoard(game, winner, meIsFirstSide) {
+      if (this.boardMode === 'local') return;
+      if (winner === 'TIE') { this._recordResult(game, 'tie', 0); return; }
+      const iAmFirstSide = this.boardMode === 'ai' ? true : this.p2p.isHost;
+      const iWon = meIsFirstSide === iAmFirstSide;
+      this._recordResult(game, iWon ? 'win' : 'lose', 0);
     }
 
     _playTTT(i, fromRemote = false) {
@@ -2340,11 +2720,18 @@
       if (this.boardMode === 'p2p' && !fromRemote) { this.p2p.send({ scope: 'board', type: 'MOVE', game: 'ttt', i }); this.isMyTurn = false; }
       else if (this.boardMode === 'p2p' && fromRemote) this.isMyTurn = true;
       this._renderBoardArena();
-      if (this.ttt.winner) { this.sound.play(this.ttt.winner === 'TIE' ? 'click' : 'win'); return; }
+      if (this.ttt.winner) {
+        this.sound.play(this.ttt.winner === 'TIE' ? 'click' : 'win');
+        this._maybeRecordBoard('tictactoe', this.ttt.winner, this.ttt.winner === 'X');
+        return;
+      }
       if (this.boardMode === 'ai' && this.ttt.turn === 'O') {
         setTimeout(() => {
           const ai = this.ttt.getAIMove('hard');
-          if (ai !== null) { this.ttt.move(ai); this.sound.play('move'); this._renderBoardArena(); if (this.ttt.winner) this.sound.play(this.ttt.winner === 'TIE' ? 'click' : 'lose'); }
+          if (ai !== null) {
+            this.ttt.move(ai); this.sound.play('move'); this._renderBoardArena();
+            if (this.ttt.winner) { this.sound.play(this.ttt.winner === 'TIE' ? 'click' : 'lose'); this._maybeRecordBoard('tictactoe', this.ttt.winner, this.ttt.winner === 'X'); }
+          }
         }, 350);
       }
     }
@@ -2357,11 +2744,18 @@
       if (this.boardMode === 'p2p' && !fromRemote) { this.p2p.send({ scope: 'board', type: 'MOVE', game: 'c4', col }); this.isMyTurn = false; }
       else if (this.boardMode === 'p2p' && fromRemote) this.isMyTurn = true;
       this._renderBoardArena();
-      if (this.c4.winner) { this.sound.play(this.c4.winner === 'TIE' ? 'click' : 'win'); return; }
+      if (this.c4.winner) {
+        this.sound.play(this.c4.winner === 'TIE' ? 'click' : 'win');
+        this._maybeRecordBoard('connect4', this.c4.winner, this.c4.winner === 1);
+        return;
+      }
       if (this.boardMode === 'ai' && this.c4.turn === 2) {
         setTimeout(() => {
           const ai = this.c4.getAIMove();
-          if (ai !== null) { this.c4.drop(ai); this.sound.play('move'); this._renderBoardArena(); if (this.c4.winner) this.sound.play(this.c4.winner === 'TIE' ? 'click' : 'lose'); }
+          if (ai !== null) {
+            this.c4.drop(ai); this.sound.play('move'); this._renderBoardArena();
+            if (this.c4.winner) { this.sound.play(this.c4.winner === 'TIE' ? 'click' : 'lose'); this._maybeRecordBoard('connect4', this.c4.winner, this.c4.winner === 1); }
+          }
         }, 350);
       }
     }
@@ -2373,7 +2767,7 @@
         this.chess.move(fromR, fromC, r, c);
         this.isMyTurn = true;
         this._renderBoardArena();
-        if (this.chess.winner) this.sound.play('win');
+        if (this.chess.winner) { this.sound.play('win'); this._maybeRecordBoard('chess', this.chess.winner, this.chess.winner === 'White'); }
         return;
       }
       if (this.chess.selected && this.chess.validMoves.some(m => m.r === r && m.c === c)) {
@@ -2382,11 +2776,14 @@
         this.sound.play('move');
         if (this.boardMode === 'p2p') { this.p2p.send({ scope: 'board', type: 'MOVE', game: 'chess', fromR: from.r, fromC: from.c, r, c }); this.isMyTurn = false; }
         this._renderBoardArena();
-        if (this.chess.winner) { this.sound.play('win'); return; }
+        if (this.chess.winner) { this.sound.play('win'); this._maybeRecordBoard('chess', this.chess.winner, this.chess.winner === 'White'); return; }
         if (this.boardMode === 'ai' && this.chess.turn === 'b') {
           setTimeout(() => {
             const m = this.chess.getAIMove();
-            if (m) { this.chess.move(m.from.r, m.from.c, m.to.r, m.to.c); this.sound.play('move'); this._renderBoardArena(); if (this.chess.winner) this.sound.play('lose'); }
+            if (m) {
+              this.chess.move(m.from.r, m.from.c, m.to.r, m.to.c); this.sound.play('move'); this._renderBoardArena();
+              if (this.chess.winner) { this.sound.play('lose'); this._maybeRecordBoard('chess', this.chess.winner, this.chess.winner === 'White'); }
+            }
           }, 400);
         }
       } else {
@@ -2418,11 +2815,11 @@
       body.innerHTML = `
         <div class="az-flex-col az-gap-3">
           <div class="az-flex-between az-card" style="background:rgba(255,204,0,0.12);">
-            <span class="az-text-headline">💰 Guthaben</span>
-            <span class="az-badge az-badge-gold" data-wallet-badge>${this.wallet.balance.toLocaleString('de-DE')} Coins</span>
+            <span class="az-flex az-gap-1 az-text-headline">${Icon('wallet', { size: 16 })}<span>Guthaben</span></span>
+            <span class="az-badge az-badge-gold" data-wallet-badge>${this.wallet.balance.toLocaleString('de-DE')}</span>
           </div>
           <div class="az-grid-3">
-            ${window.CASINO_GAMES.map(g => `<div class="az-game-tile" data-casino="${g.id}"><div class="az-tile-icon">${g.icon}</div><div class="az-tile-label">${g.title}</div></div>`).join('')}
+            ${window.CASINO_GAMES.map(g => `<div class="az-game-tile" data-casino="${g.id}">${Icon(g.icon, { size: 22 })}<div class="az-tile-label">${g.title}</div></div>`).join('')}
           </div>
           <div class="az-text-footnote" style="text-align:center;">Virtuelle Coins zum Spaß — kein Echtgeld, kein Server.</div>
         </div>`;
@@ -2437,10 +2834,10 @@
       body.innerHTML = `
         <div class="az-flex-col az-gap-3">
           <div class="az-flex-between">
-            <button id="az-casino-back" class="az-btn az-btn-plain">← Zurück</button>
-            <span class="az-badge az-badge-gold" data-wallet-badge>${this.wallet.balance.toLocaleString('de-DE')} Coins</span>
+            <button id="az-casino-back" class="az-btn az-btn-plain az-flex az-gap-1">${Icon('chevronLeft', { size: 15 })}<span>Zurück</span></button>
+            <span class="az-badge az-badge-gold" data-wallet-badge>${this.wallet.balance.toLocaleString('de-DE')}</span>
           </div>
-          <div class="az-text-title3" style="text-align:center;">${game.icon} ${game.title}</div>
+          <div class="az-flex az-gap-2" style="justify-content:center;align-items:center;">${Icon(game.icon, { size: 20 })}<span class="az-text-title3">${game.title}</span></div>
           <div id="az-casino-panel"></div>
         </div>`;
       body.querySelector('#az-casino-back').onclick = () => {
@@ -2452,6 +2849,7 @@
       const ctx = {
         wallet: this.wallet,
         playSound: (n) => this.sound.play(n),
+        recordResult: (result, delta) => this._recordResult(game.id, result, delta),
         duel: {
           isConnected: () => this.p2p.isConnected(),
           isHost: () => this.p2p.isHost,
@@ -2461,6 +2859,40 @@
         }
       };
       game.render(body.querySelector('#az-casino-panel'), ctx);
+    }
+
+    // ==========================================================
+    // LEADERBOARD / NETWORK TAB
+    // ==========================================================
+    _renderLeaderboard(body) {
+      if (!this.ledger) {
+        body.innerHTML = `<div class="az-text-footnote" style="text-align:center;">Lade lokales Klassenbuch…</div>`;
+        return;
+      }
+      const rows = this.network.buildLeaderboard(this.ledger.deviceId);
+      body.innerHTML = `
+        <div class="az-flex-col az-gap-3">
+          <div class="az-card az-flex-col az-gap-1">
+            <span class="az-flex az-gap-1 az-text-headline">${Icon('link', { size: 15 })}<span>Dein Netzwerk</span></span>
+            <span class="az-text-footnote">
+              ${rows.length} bekannte Geräte · ${this.ledger.chain.length} eigene Blöcke.
+              Jede Online-Verbindung tauscht euer gesamtes bekanntes Netzwerk aus — so wächst deine Rangliste mit jedem neuen Kontakt, ganz ohne Server.
+            </span>
+          </div>
+          <div class="az-flex-col az-gap-2">
+            ${rows.length === 0
+              ? `<div class="az-text-footnote" style="text-align:center;">Noch keine Ergebnisse — spiel eine Runde Arcade oder Casino.</div>`
+              : rows.map((r, i) => `
+                <div class="az-leaderboard-row ${r.isMe ? 'az-me' : ''}">
+                  <div class="az-lb-rank">${i + 1}</div>
+                  <div class="az-lb-info">
+                    <div class="az-lb-name">${r.name}${r.isMe ? ' (Du)' : ''}</div>
+                    <div class="az-lb-meta">${r.fingerprint} · ${r.blocks} Blöcke · ${r.wins}S/${r.losses}N</div>
+                  </div>
+                  <div class="az-lb-score ${r.netCoins > 0 ? 'az-positive' : r.netCoins < 0 ? 'az-negative' : ''}">${r.netCoins > 0 ? '+' : ''}${r.netCoins}</div>
+                </div>`).join('')}
+          </div>
+        </div>`;
     }
   }
 
@@ -2513,9 +2945,7 @@
         background: var(--az-blue); color:#fff; border:none; border-radius:24px; font-weight:700; font-size:13px;
         cursor:pointer; box-shadow:0 8px 20px rgba(0,0,0,0.3);
       }
-      .az-pill.az-hidden { display:none !important; }
-      .az-window { width: 380px; max-height: 620px; border-radius: 20px; box-shadow: 0 24px 48px rgba(0,0,0,0.35); display:flex; flex-direction:column; overflow:hidden; }
-      .az-window.az-hidden { display:none !important; }
+      .az-window { width: min(380px, calc(100vw - 32px)); max-height: min(620px, calc(100vh - 32px)); border-radius: 20px; box-shadow: 0 24px 48px rgba(0,0,0,0.35); display:flex; flex-direction:column; overflow:hidden; }
       .az-header { display:flex; align-items:center; justify-content:space-between; padding: 12px 16px; cursor:move; border-bottom:1px solid var(--az-separator); }
       .az-social-panel { margin: 8px 16px 0; }
     `;

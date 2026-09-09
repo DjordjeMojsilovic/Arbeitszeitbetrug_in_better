@@ -3,7 +3,7 @@
  * lets the installed app open without a network connection. Online P2P
  * play still needs internet for the initial WebRTC handshake.
  */
-const CACHE_NAME = 'arcade-casino-shell-v5';
+const CACHE_NAME = 'arcade-casino-shell-v6';
 const SHELL_FILES = [
   './',
   './index.html',
@@ -11,10 +11,12 @@ const SHELL_FILES = [
   '../lib/peerjs.min.js',
   '../src/core/cards.js',
   '../src/core/wallet.js',
+  '../src/core/ledger.js',
   '../src/core/board-games.js',
   '../src/core/casino-games.js',
   '../src/core/p2p.js',
   '../src/ui/theme.js',
+  '../src/ui/icons.js',
   '../src/ui/casino-panels.js',
   '../src/ui/app.js',
   '../src/entry-webapp.js'
