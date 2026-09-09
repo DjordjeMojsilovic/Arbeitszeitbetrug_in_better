@@ -1,14 +1,14 @@
 {
   "manifest_version": 3,
-  "name": "💼 Arbeitszeitbetrug Arcade",
-  "version": "2.0.0",
-  "description": "Multiplayer arcade floating GUI with Tic-Tac-Toe and 4-Gewinnt (Connect 4) via WebRTC peer connection.",
+  "name": "Arbeitszeitbetrug Arcade & Casino",
+  "version": "5.0.0",
+  "description": "Floating Arcade & Casino widget: Tic-Tac-Toe, 4-Gewinnt, Schach und 11 Casino-Spiele (Blackjack, Roulette, Video Poker, Baccarat, Craps, Sic Bo, Höher/Tiefer, Münzwurf, Plinko, Glücksrad, Slots) mit P2P WebRTC Online-Modus — ganz ohne Server oder Datenbank.",
   "permissions": [
     "storage"
   ],
   "action": {
     "default_popup": "popup/popup.html",
-    "default_title": "Arbeitszeitbetrug Arcade"
+    "default_title": "Arbeitszeitbetrug Arcade & Casino"
   },
   "content_scripts": [
     {
@@ -18,7 +18,17 @@
       ],
       "js": [
         "lib/peerjs.min.js",
-        "content.js"
+        "src/core/cards.js",
+        "src/core/wallet.js",
+        "src/core/ledger.js",
+        "src/core/board-games.js",
+        "src/core/casino-games.js",
+        "src/core/p2p.js",
+        "src/ui/theme.js",
+        "src/ui/icons.js",
+        "src/ui/casino-panels.js",
+        "src/ui/app.js",
+        "src/entry-floating.js"
       ],
       "run_at": "document_end"
     }
