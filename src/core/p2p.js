@@ -18,6 +18,8 @@
       this.roomCode = null;
       this.username = 'Player';
       this.remoteUsername = null;
+      this._retriedHost = false;
+      this._retriedJoin = false;
       this.callbacks = {
         onConnected: null,
         onDisconnected: null,
@@ -46,32 +48,56 @@
       return Math.floor(1000 + Math.random() * 9000).toString();
     }
 
+    /** Transient signalling hiccups (the free PeerJS cloud broker occasionally
+     * drops the initial handshake) — worth one silent retry before we bother
+     * the user with an error. */
+    _isTransient(err) {
+      return err && ['network', 'socket-error', 'socket-closed', 'server-error'].includes(err.type);
+    }
+
+    _describe(err, fallback) {
+      if (!err) return fallback;
+      const type = err.type ? ` [${err.type}]` : '';
+      return `${err.message || fallback}${type}`;
+    }
+
     hostRoom(username) {
       this.disconnect();
       this.isHost = true;
       this.username = username || this.username;
       this.roomCode = this.generatePin();
+      this._retriedHost = false;
+      this._startHostPeer();
+      return this.roomCode;
+    }
+
+    _startHostPeer() {
       const PeerClass = this.getPeerClass();
-      if (!PeerClass) { this._error('PeerJS ist nicht geladen.'); return null; }
+      if (!PeerClass) { this._error('PeerJS ist nicht geladen.'); return; }
 
       try {
         this.peer = new PeerClass(NAMESPACE + this.roomCode, this._iceConfig());
+        this._watchPeerLifecycle();
         this.peer.on('connection', (connection) => {
           this.conn = connection;
           this._bind();
         });
         this.peer.on('error', (err) => {
           if (err && err.type === 'unavailable-id') {
+            // Someone already holds this PIN — pick a fresh one and retry.
             this.roomCode = this.generatePin();
-            this.hostRoom(this.username);
+            this._startHostPeer();
+          } else if (this._isTransient(err) && !this._retriedHost) {
+            // Keep the same PIN — it may already be visible to the other player.
+            this._retriedHost = true;
+            setTimeout(() => this._startHostPeer(), 1200);
           } else {
-            this._error((err && err.message) || 'Verbindungsfehler');
+            this._error(this._describe(err, 'Verbindungsfehler beim Erstellen des Raums'));
           }
         });
       } catch (e) {
-        this._error('WebRTC Peer konnte nicht gestartet werden.');
+        this._error('WebRTC Peer konnte nicht gestartet werden: ' + e.message);
       }
-      return this.roomCode;
     }
 
     joinRoom(code, username) {
@@ -79,22 +105,43 @@
       this.isHost = false;
       this.username = username || this.username;
       this.roomCode = (code || '').trim();
+      this._retriedJoin = false;
+      this._startJoinPeer();
+    }
+
+    _startJoinPeer() {
       const PeerClass = this.getPeerClass();
       if (!PeerClass) { this._error('PeerJS ist nicht geladen.'); return; }
 
       try {
         this.peer = new PeerClass(this._iceConfig());
+        this._watchPeerLifecycle();
         this.peer.on('open', () => {
           this.conn = this.peer.connect(NAMESPACE + this.roomCode, { reliable: true });
           this._bind();
         });
         this.peer.on('error', (err) => {
-          const isUnavailable = err && err.type === 'peer-unavailable';
-          this._error(isUnavailable ? 'PIN nicht gefunden oder Host offline.' : ((err && err.message) || 'Verbindungsfehler'));
+          if (err && err.type === 'peer-unavailable') {
+            this._error('PIN nicht gefunden oder Host offline.');
+          } else if (this._isTransient(err) && !this._retriedJoin) {
+            this._retriedJoin = true;
+            setTimeout(() => this._startJoinPeer(), 1200);
+          } else {
+            this._error(this._describe(err, 'Verbindungsfehler beim Beitreten'));
+          }
         });
       } catch (e) {
-        this._error('Verbindung zum Raum fehlgeschlagen.');
+        this._error('Verbindung zum Raum fehlgeschlagen: ' + e.message);
       }
+    }
+
+    /** Auto-reconnect if the signalling socket drops after the peer was
+     * already registered — this does not affect an established game
+     * connection, only the ability to accept a *new* incoming connection. */
+    _watchPeerLifecycle() {
+      this.peer.on('disconnected', () => {
+        if (this.peer && !this.peer.destroyed) this.peer.reconnect();
+      });
     }
 
     _bind() {
@@ -112,7 +159,7 @@
       this.conn.on('close', () => {
         if (this.callbacks.onDisconnected) this.callbacks.onDisconnected();
       });
-      this.conn.on('error', () => this._error('Netzwerkverbindung unterbrochen.'));
+      this.conn.on('error', (err) => this._error(this._describe(err, 'Netzwerkverbindung unterbrochen.')));
     }
 
     _error(msg) {
